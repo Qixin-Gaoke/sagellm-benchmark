@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Legacy `YEAR1_WORKLOADS`/`M1_WORKLOADS` retained internally behind `DeprecationWarning` for backward compatibility only.
 
 ### Added
+- 新增 `scripts/compare_openai_endpoints.sh`：支持对两个 OpenAI-compatible endpoint（如 `sageLLM` vs `vLLM Ascend`）进行 live E2E 对比评测，并生成 `comparison.md` 汇总；支持通过 `BATCH_SIZES`（默认 `1,2,4`）与 `MAX_OUTPUT_TOKENS` 环境变量控制评测档位。
 - **Issue #23**: Added `scripts/local_ci_fallback.sh` for local equivalent CI checks when GitHub Actions is blocked by billing/quota (runs pre-commit, version guard, pytest+coverage, and build+twine).
 - **Issue #1**: Extended `WorkloadType` with `STREAMING`, `BATCH_INFERENCE`, `MIXED`; added `top_k`, `repetition_penalty`, `stream`, `warmup_rounds`, `concurrency` to `WorkloadConfig`; added predefined workload lists `STREAMING_WORKLOADS`, `BATCH_INFERENCE_WORKLOADS`, `MIXED_WORKLOADS`; extended `get_workloads_by_selector()` with new selectors.
 - **Issue #2**: New `HTMLReporter` (`reporters/html_reporter.py`) generating interactive Chart.js reports for single-run and multi-run comparison with latency/throughput/KV-cache charts.

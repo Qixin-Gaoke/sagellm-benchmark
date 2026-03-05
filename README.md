@@ -90,6 +90,35 @@ sagellm-benchmark report --input ./benchmark_results/perf_results.json --format 
 sagellm-benchmark report --input ./benchmark_results/perf_results.json --plot --plot-format png
 ```
 
+## Ascend vLLM 对比评测
+
+`sagellm-benchmark` 的 `perf --live` 已支持任意 OpenAI-compatible endpoint（包括 vLLM server）。
+
+1. 分别启动两个服务（例如 `sageLLM` 与 `vLLM Ascend`），确保都提供 `/v1/models` 与 `/v1/chat/completions`。
+2. 运行对比脚本：
+
+```bash
+cd sagellm-benchmark
+chmod +x scripts/compare_openai_endpoints.sh
+scripts/compare_openai_endpoints.sh \
+   http://127.0.0.1:8901/v1 \
+   http://127.0.0.1:8000/v1 \
+   Qwen/Qwen2.5-0.5B-Instruct
+
+# 可选：指定 batch 档位（默认 1,2,4）
+BATCH_SIZES=1,2,4 MAX_OUTPUT_TOKENS=64 \
+scripts/compare_openai_endpoints.sh \
+   http://127.0.0.1:8901/v1 \
+   http://127.0.0.1:8000/v1 \
+   Qwen/Qwen2.5-0.5B-Instruct
+```
+
+输出会写入 `benchmark_results/compare_*/`，包含：
+
+- `endpoint_a.json/.md`
+- `endpoint_b.json/.md`
+- `comparison.md`（汇总 TTFT/TBT/TPS 差异）
+
 ## Workloads
 
 - **Q1**: Short Q&A — 32 prompt → 64 output (5 requests)
