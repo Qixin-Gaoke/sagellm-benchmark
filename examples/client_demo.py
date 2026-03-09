@@ -33,7 +33,9 @@ async def demo_gateway_client() -> None:
     try:
         from sagellm_benchmark.clients.openai_client import GatewayClient
     except ImportError:
-        logger.error("openai package not installed. Install with: pip install openai")
+        logger.error(
+            "GatewayClient dependencies are missing. Install with: pip install -U isagellm-benchmark"
+        )
         return
 
     # Connect to local sagellm-gateway
