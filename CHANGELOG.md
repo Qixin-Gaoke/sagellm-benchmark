@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - CUDA benchmark workflow: recommend running vLLM in a dedicated NVIDIA Docker container via `scripts/start_vllm_cuda_docker.sh` / `scripts/stop_vllm_cuda_docker.sh`, defaulting to `--network host` and preserved failure logs so repeated `sagellm-benchmark compare` runs can reuse a stable vLLM endpoint instead of reinstalling host-side wheels.
+- `scripts/setup_vllm_ascend_compare_env.sh` 新增官方 profile 机制：支持按主机 CANN 版本在 `official-v0.11.0` 与 `official-v0.13.0` 之间选择，旧/非目标 CANN 版本会在安装前 fail-fast，避免误把不兼容机器当作官方 endpoint compare 环境。
+- `scripts/setup_vllm_ascend_compare_env.sh` 现在会先对完整 Ascend endpoint compare 栈执行 `pip install --dry-run` 解析校验；默认要求同版本 `vllm + vllm-ascend`，并拒绝直接污染主 `sagellm` conda 环境。若版本矩阵不可解，将 fail-fast 并提示切换到官方矩阵或专用容器/环境。
+- `docs/ASCEND_BENCHMARK.md` 去掉了“当前主环境已默认跑通本地 endpoint compare 并固化结果”的误导性表述，改为记录真实的专用环境策略、已观测 resolver 冲突，以及官方矩阵的使用方式。
+- 新增 `scripts/run_vllm_ascend_container.sh`，支持使用官方 `vllm-ascend` Docker 镜像通过 `start/status/logs/stop` 管理容器化 endpoint，并自动做设备映射与 `/v1/models` 判活。
+- `scripts/setup_vllm_ascend_compare_env.sh` 不再硬编码 `/opt/miniconda3/envs/bench-vllm-ascend/bin/python`；现在优先使用 `BENCH_VLLM_ASCEND_PY`，否则使用当前已激活的非 `base` conda 环境，并支持通过 `SAGELLM_ASCEND_TOOLKIT_HOME` 适配非标准 Ascend toolkit 布局。
 - `hooks/pre-push` 默认不再因检测到发布凭证而自动发布；只有显式使用 `git push -o sagellm-publish origin main-dev` 或 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main-dev` 时才会触发发布。
 - `hooks/post-commit` 默认不再在每次提交后自动 bump 版本；普通 `git push` 也不再触发 PyPI 版本冲突检查，只有显式发布时才会处理版本号。
 - `compare` 现支持 `--target-command LABEL=COMMAND`，`vllm-compare run` 现支持 `--start-sagellm-cmd` / `--start-vllm-cmd`：当本地 endpoint 未启动时可由 benchmark 先拉起服务、等待就绪，再执行对比；若这些进程由 benchmark 启动，则 cleanup prompt 会优先按其独立进程组做精确回收。

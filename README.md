@@ -186,6 +186,7 @@ sagellm-benchmark vllm-compare run \
 
 - [docs/ASCEND_BENCHMARK.md](docs/ASCEND_BENCHMARK.md)
 - [scripts/setup_vllm_ascend_compare_env.sh](scripts/setup_vllm_ascend_compare_env.sh)
+- [scripts/run_vllm_ascend_container.sh](scripts/run_vllm_ascend_container.sh)
 
 其中 `pyproject.toml` 里的 benchmark extras 是依赖声明的唯一事实来源；
 `scripts/setup_vllm_ascend_compare_env.sh` 只是在其之上附加一套已验证的 Ascend 版本矩阵，作为便利层而非新的依赖入口。
