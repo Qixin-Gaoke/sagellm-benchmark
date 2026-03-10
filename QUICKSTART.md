@@ -46,6 +46,36 @@ sagellm-benchmark vllm-compare run \
   --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
+对于 A100/CUDA 主机，推荐把 vLLM 固定放进 Docker 容器里运行，避免宿主机每次重复拉取 wheel、重配 torch ABI、或在冷启动时因为本地环境漂移导致失败：
+
+```bash
+cd sagellm-benchmark
+VLLM_GPU_DEVICE=1 VLLM_PORT=9100 ./scripts/start_vllm_cuda_docker.sh
+
+sagellm-benchmark vllm-compare run \
+  --sagellm-url http://127.0.0.1:8901/v1 \
+  --vllm-url http://127.0.0.1:9100/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+如需在 endpoint 缺失时由 benchmark 自动拉起 Dockerized vLLM：
+
+```bash
+sagellm-benchmark vllm-compare run \
+  --sagellm-url http://127.0.0.1:8901/v1 \
+  --vllm-url http://127.0.0.1:9100/v1 \
+  --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+  --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+默认不会给 vLLM 容器加 `--rm`，这样如果启动失败可以直接检查日志：
+
+```bash
+docker logs sagellm-benchmark-vllm | tail -n 200
+```
+
+该 helper 默认使用 `--network host`。这在 A100 服务器上通常更稳，因为部分机器的 Docker bridge 对外不可达，容器会在下载模型元数据时直接报 `Network is unreachable`。
+
 ## 5-Minute Quick Start
 
 ### Option 1: One-Click Script (Recommended)

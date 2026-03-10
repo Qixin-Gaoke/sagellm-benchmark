@@ -116,6 +116,30 @@ sagellm-benchmark vllm-compare run \
    --model Qwen/Qwen2.5-0.5B-Instruct \
    --prompt-cleanup
 
+# Recommended on A100/CUDA hosts: keep vLLM in a dedicated Docker container,
+# then reuse the stable endpoint for each compare run.
+VLLM_GPU_DEVICE=1 VLLM_PORT=9100 \
+   ./scripts/start_vllm_cuda_docker.sh
+
+sagellm-benchmark vllm-compare run \
+   --sagellm-url http://127.0.0.1:8901/v1 \
+   --vllm-url http://127.0.0.1:9100/v1 \
+   --model Qwen/Qwen2.5-1.5B-Instruct
+
+# Or let compare bootstrap the Dockerized vLLM endpoint on demand.
+sagellm-benchmark vllm-compare run \
+   --sagellm-url http://127.0.0.1:8901/v1 \
+   --vllm-url http://127.0.0.1:9100/v1 \
+   --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+   --model Qwen/Qwen2.5-1.5B-Instruct
+
+# If startup fails, logs remain available because the helper does not use
+# --rm by default:
+docker logs sagellm-benchmark-vllm | tail -n 200
+
+# The helper defaults to --network host, which is more reliable on locked-down
+# servers where Docker bridge networking cannot reach huggingface.co.
+
 # Generate charts (PNG/PDF, dark theme)
 sagellm-benchmark perf --type e2e --plot --plot-format png --plot-format pdf --theme dark
 ```

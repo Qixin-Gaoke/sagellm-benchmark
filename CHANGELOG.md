@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- CUDA benchmark workflow: recommend running vLLM in a dedicated NVIDIA Docker container via `scripts/start_vllm_cuda_docker.sh` / `scripts/stop_vllm_cuda_docker.sh`, defaulting to `--network host` and preserved failure logs so repeated `sagellm-benchmark compare` runs can reuse a stable vLLM endpoint instead of reinstalling host-side wheels.
 - `hooks/pre-push` 默认不再因检测到发布凭证而自动发布；只有显式使用 `git push -o sagellm-publish origin main-dev` 或 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main-dev` 时才会触发发布。
 - `hooks/post-commit` 默认不再在每次提交后自动 bump 版本；普通 `git push` 也不再触发 PyPI 版本冲突检查，只有显式发布时才会处理版本号。
 - `compare` 现支持 `--target-command LABEL=COMMAND`，`vllm-compare run` 现支持 `--start-sagellm-cmd` / `--start-vllm-cmd`：当本地 endpoint 未启动时可由 benchmark 先拉起服务、等待就绪，再执行对比；若这些进程由 benchmark 启动，则 cleanup prompt 会优先按其独立进程组做精确回收。

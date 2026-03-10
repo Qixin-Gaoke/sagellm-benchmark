@@ -118,6 +118,42 @@ sagellm-benchmark vllm-compare run \
     --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
+在 A100/CUDA 机器上，推荐把 vLLM 固定为独立 Docker 服务，而不是每次在宿主机里重新安装 / 重配 `vllm` wheel：
+
+```bash
+cd sagellm-benchmark
+VLLM_GPU_DEVICE=1 VLLM_PORT=9100 ./scripts/start_vllm_cuda_docker.sh
+
+sagellm-benchmark vllm-compare run \
+    --sagellm-url http://127.0.0.1:8901/v1 \
+    --vllm-url http://127.0.0.1:9100/v1 \
+    --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+如果希望 compare 在 endpoint 缺失时自动把容器拉起：
+
+```bash
+sagellm-benchmark vllm-compare run \
+    --sagellm-url http://127.0.0.1:8901/v1 \
+    --vllm-url http://127.0.0.1:9100/v1 \
+    --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+    --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+默认容器名为 `sagellm-benchmark-vllm`，停止时执行：
+
+```bash
+./scripts/stop_vllm_cuda_docker.sh
+```
+
+默认情况下该 helper 不会给容器加 `--rm`，这样遇到 OOM、模型加载失败或参数不兼容时，可以直接查看容器日志：
+
+```bash
+docker logs sagellm-benchmark-vllm | tail -n 200
+```
+
+该 helper 默认使用 `--network host`，优先规避受限服务器上 Docker bridge 无法访问外网仓库的问题；只有明确需要端口映射隔离时，再通过 `VLLM_DOCKER_NETWORK_MODE=bridge` 切回 bridge 模式。
+
 推荐 CLI：
 
 ```bash
