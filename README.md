@@ -201,9 +201,6 @@ sagellm-benchmark vllm-compare run \
    --sagellm-url http://127.0.0.1:8901/v1 \
    --vllm-url http://127.0.0.1:8000/v1 \
    --model Qwen/Qwen2.5-0.5B-Instruct
-
-# 兼容脚本仍可用，但只是对新 CLI 的薄包装
-scripts/compare_openai_endpoints.sh http://127.0.0.1:8000/v1 http://127.0.0.1:8901/v1
 ```
 
 等价的正式 CLI 用法：

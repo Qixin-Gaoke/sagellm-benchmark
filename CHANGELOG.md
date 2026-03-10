@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- 删除 `scripts/compare_openai_endpoints.sh` 这类纯兼容 compare wrapper，统一收口到 `sagellm-benchmark compare` / `sagellm-benchmark vllm-compare run`，避免旧 shell 入口继续制造参数顺序与 cleanup 行为歧义。
 - CUDA benchmark workflow: recommend running vLLM in a dedicated NVIDIA Docker container via `scripts/start_vllm_cuda_docker.sh` / `scripts/stop_vllm_cuda_docker.sh`, defaulting to `--network host` and preserved failure logs so repeated `sagellm-benchmark compare` runs can reuse a stable vLLM endpoint instead of reinstalling host-side wheels.
 - `scripts/setup_vllm_ascend_compare_env.sh` 新增官方 profile 机制：支持按主机 CANN 版本在 `official-v0.11.0` 与 `official-v0.13.0` 之间选择，旧/非目标 CANN 版本会在安装前 fail-fast，避免误把不兼容机器当作官方 endpoint compare 环境。
 - `scripts/setup_vllm_ascend_compare_env.sh` 现在会先对完整 Ascend endpoint compare 栈执行 `pip install --dry-run` 解析校验；默认要求同版本 `vllm + vllm-ascend`，并拒绝直接污染主 `sagellm` conda 环境。若版本矩阵不可解，将 fail-fast 并提示切换到官方矩阵或专用容器/环境。
@@ -23,7 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - benchmark quickstart now installs the matching compare extra (`vllm-client` or `vllm-ascend-client`) before any convenience-layer package pinning, so runtime setup stays aligned with `pyproject.toml` as the dependency source of truth.
 - README / client guides now explicitly state that benchmark owns third-party engine comparison, `compare` is the canonical live entrypoint, and quickstart is only a convenience wrapper over benchmark extras.
 - `sagellm-benchmark compare` 现在作为 benchmark 侧唯一正式跨引擎对比入口；`perf --live` 仅保留单 endpoint 性能采集职责。
-- `scripts/compare_openai_endpoints.sh` 现在只是 `sagellm-benchmark compare` 的便利 wrapper，正式对比逻辑统一收敛到 benchmark CLI。
 - `clients/vllm_client.py` 的 server mode 改为复用通用 `GatewayClient`，避免在 vLLM 专用 client 中重复维护 OpenAI-compatible 请求、判活与指标采集逻辑。
 - benchmark compare-client dependency policy: `pyproject.toml` extras are now the canonical source for third-party benchmark integrations; convenience scripts only layer validated install pins on top.
 - `scripts/setup_vllm_ascend_compare_env.sh` now installs the local `vllm-ascend-client` benchmark extra before applying the validated Ascend version matrix.

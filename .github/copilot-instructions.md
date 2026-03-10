@@ -25,7 +25,7 @@ When asked to update package version, change only `_version.py`.
    - `sagellm-benchmark vllm-compare install-ascend`
    - `sagellm-benchmark vllm-compare run --sagellm-url <url> --vllm-url <url> --model <model>`
 - `sagellm-benchmark compare` remains the generic multi-endpoint entrypoint; `vllm-compare` is the thin, semantic wrapper for the common vLLM comparison path.
-- `scripts/setup_vllm_ascend_compare_env.sh` and `scripts/compare_openai_endpoints.sh` are compatibility wrappers only. Do not add new primary logic there when the same behavior belongs in the CLI.
+- `scripts/setup_vllm_ascend_compare_env.sh` is a compatibility/ops layer only. Do not add new primary logic there when the same behavior belongs in the CLI.
 - Benchmark dependency declarations must live in `pyproject.toml` extras. Scripts may pin a validated environment matrix, but must not become an alternate source of truth for compare-client dependencies.
 
 - In Ascend environments with only `vllm-ascend` installed, `python -m vllm.entrypoints.openai.api_server` may fail because `vllm` package/module is absent.

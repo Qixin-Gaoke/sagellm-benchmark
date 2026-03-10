@@ -230,14 +230,7 @@ sagellm-benchmark vllm-compare run \
   --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-兼容脚本仍可用：
-
-```bash
-scripts/compare_openai_endpoints.sh \
-  http://127.0.0.1:8000/v1 \
-  http://127.0.0.1:8901/v1 \
-  Qwen/Qwen2.5-0.5B-Instruct
-```
+不再推荐也不再保留旧的 shell compare wrapper；统一使用上面的 canonical CLI。
 
 输出目录默认在：
 
