@@ -22,6 +22,12 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
+from sagellm_benchmark.nonstream_compare import (
+    NonStreamCompareConfig,
+    parse_target_spec,
+    run_nonstream_compare,
+)
+
 console = Console()
 
 
@@ -1652,6 +1658,126 @@ def vllm_compare_run(
         prompt_cleanup=prompt_cleanup,
         header="sageLLM vs vLLM Compare",
     )
+
+
+@main.command()
+@click.option(
+    "--target",
+    "targets",
+    multiple=True,
+    required=True,
+    help=(
+        "Comparison target in LABEL=URL format. Repeat to compare multiple OpenAI-compatible "
+        "endpoints, e.g. --target sagellm=http://127.0.0.1:8901/v1 --target vllm=http://127.0.0.1:8000/v1"
+    ),
+)
+@click.option(
+    "--model",
+    type=str,
+    required=True,
+    help="Requested model name for the compare run.",
+)
+@click.option(
+    "--prompt",
+    type=str,
+    default="请用一句话介绍你自己。",
+    show_default=True,
+    help="Prompt sent to each endpoint.",
+)
+@click.option(
+    "--batch-size",
+    "batch_sizes",
+    multiple=True,
+    type=int,
+    default=(1, 2),
+    show_default=True,
+    help="Batch sizes to benchmark. Repeat for multiple values.",
+)
+@click.option(
+    "--warmup-rounds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Warmup requests per target before measured runs.",
+)
+@click.option(
+    "--rounds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Measured rounds per batch size.",
+)
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Max completion tokens for each request.",
+)
+@click.option(
+    "--temperature",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Sampling temperature for each request.",
+)
+@click.option(
+    "--api-key",
+    type=str,
+    default="sagellm-benchmark",
+    show_default=True,
+    help="API key used for all targets.",
+)
+@click.option(
+    "--request-timeout",
+    type=float,
+    default=600.0,
+    show_default=True,
+    help="Per-request timeout in seconds.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help=(
+        "Directory to save compare artifacts (default: "
+        "benchmark_results/nonstream_compare_<timestamp>)."
+    ),
+)
+def nonstream_compare(
+    targets: tuple[str, ...],
+    model: str,
+    prompt: str,
+    batch_sizes: tuple[int, ...],
+    warmup_rounds: int,
+    rounds: int,
+    max_tokens: int,
+    temperature: float,
+    api_key: str,
+    request_timeout: float,
+    output_dir: str | None,
+) -> None:
+    """Compare non-stream chat completions across multiple endpoints."""
+    try:
+        config = NonStreamCompareConfig(
+            targets=tuple(parse_target_spec(spec) for spec in targets),
+            model=model,
+            prompt=prompt,
+            batch_sizes=batch_sizes,
+            warmup_rounds=warmup_rounds,
+            rounds=rounds,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=api_key,
+            request_timeout=request_timeout,
+            output_dir=output_dir,
+        )
+        compare_output_dir = run_nonstream_compare(config)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print("[bold green]Non-stream compare complete[/bold green]")
+    console.print(f"Artifacts: {compare_output_dir}")
 
 
 @main.command()

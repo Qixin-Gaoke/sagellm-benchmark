@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Legacy `YEAR1_WORKLOADS`/`M1_WORKLOADS` retained internally behind `DeprecationWarning` for backward compatibility only.
 
 ### Added
+- 新增可复用的 non-stream compare runner：支持 `sagellm-benchmark nonstream-compare` 与 `scripts/run_nonstream_compare.py`，对多个 OpenAI-compatible `/v1/chat/completions` endpoint 做并发非流式对比，并生成 `comparison.json/.md` 与逐目标 JSON 工件。
 - `sagellm-benchmark compare`：新增统一对多个 OpenAI-compatible endpoint 做 live 评测的 CLI 入口，自动产出 `<target>.json/.md` 与 `comparison.json/.md`。
 - 新增 `scripts/setup_vllm_ascend_compare_env.sh`：一键安装已验证版本矩阵（`torch==2.7.1`、`torch-npu==2.7.1`、`transformers==4.57.1`、`vllm-ascend==0.11.0`）并执行最小 Ascend 烟测，便于后续持续复现 `vllm-ascend` vs `sagellm` 性能对比。
 - 新增 `scripts/compare_openai_endpoints.sh`：支持对两个 OpenAI-compatible endpoint（如 `sageLLM` vs `vLLM Ascend`）进行 live E2E 对比评测，并生成 `comparison.md` 汇总；支持通过 `BATCH_SIZES`（默认 `1,2,4`）与 `MAX_OUTPUT_TOKENS` 环境变量控制评测档位。

@@ -8,6 +8,11 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from sagellm_benchmark.cli import main
+from sagellm_benchmark.nonstream_compare import (
+    NonStreamCompareConfig,
+    NonStreamTarget,
+    run_nonstream_compare,
+)
 
 
 def test_perf_help():
@@ -143,6 +148,116 @@ def test_compare_generates_files(monkeypatch):
         assert payload["kind"] == "compare"
         assert payload["baseline"] == "sagellm"
         assert len(payload["targets"]) == 2
+
+
+def test_nonstream_compare_module_generates_files():
+    """Module runner should emit reusable non-stream compare artifacts."""
+
+    responses = {
+        "sagellm": {
+            "ok": True,
+            "status_code": 200,
+            "elapsed_ms": 25.0,
+            "completion_text": "sage reply",
+            "finish_reason": "stop",
+            "prompt_tokens": 16,
+            "completion_tokens": 6,
+            "total_tokens": 22,
+            "raw_response": {},
+        },
+        "vllm": {
+            "ok": True,
+            "status_code": 200,
+            "elapsed_ms": 15.0,
+            "completion_text": "vllm reply",
+            "finish_reason": "stop",
+            "prompt_tokens": 16,
+            "completion_tokens": 8,
+            "total_tokens": 24,
+            "raw_response": {},
+        },
+    }
+
+    def fake_request(target, request_config):
+        return dict(responses[target.label])
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = run_nonstream_compare(
+            NonStreamCompareConfig(
+                targets=(
+                    NonStreamTarget("sagellm", "http://127.0.0.1:8901/v1"),
+                    NonStreamTarget("vllm", "http://127.0.0.1:8000/v1"),
+                ),
+                model="Qwen/Qwen2.5-0.5B-Instruct",
+                prompt="hello",
+                batch_sizes=(1, 2),
+                warmup_rounds=1,
+                rounds=1,
+                max_tokens=8,
+                temperature=0.0,
+                api_key="token",
+                request_timeout=10.0,
+                output_dir="nonstream_out",
+            ),
+            request_fn=fake_request,
+        )
+
+        assert output_dir == Path("nonstream_out")
+        assert (output_dir / "sagellm.json").exists()
+        assert (output_dir / "vllm.json").exists()
+        assert (output_dir / "comparison.json").exists()
+        assert (output_dir / "comparison.md").exists()
+
+        with open(output_dir / "comparison.json") as f:
+            payload = json.load(f)
+        assert payload["kind"] == "nonstream_compare"
+        assert payload["baseline"] == "sagellm"
+        assert [target["label"] for target in payload["targets"]] == ["sagellm", "vllm"]
+
+
+def test_nonstream_compare_cli_invokes_module(monkeypatch):
+    """CLI should forward parsed options into the reusable non-stream compare module."""
+
+    captured: dict[str, object] = {}
+
+    def fake_run_nonstream_compare(config):
+        captured["config"] = config
+        return Path("compare_out")
+
+    monkeypatch.setattr("sagellm_benchmark.cli.run_nonstream_compare", fake_run_nonstream_compare)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "nonstream-compare",
+            "--target",
+            "sagellm=http://127.0.0.1:8901/v1",
+            "--target",
+            "vllm=http://127.0.0.1:8000/v1",
+            "--model",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--prompt",
+            "hello",
+            "--batch-size",
+            "1",
+            "--batch-size",
+            "2",
+            "--rounds",
+            "2",
+            "--output-dir",
+            "compare_out",
+        ],
+    )
+
+    assert result.exit_code == 0
+    config = captured["config"]
+    assert isinstance(config, NonStreamCompareConfig)
+    assert [target.label for target in config.targets] == ["sagellm", "vllm"]
+    assert config.batch_sizes == (1, 2)
+    assert config.rounds == 2
+    assert config.output_dir == "compare_out"
 
 
 def test_vllm_compare_run_generates_files(monkeypatch):

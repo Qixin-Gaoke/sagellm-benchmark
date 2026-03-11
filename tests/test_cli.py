@@ -25,6 +25,7 @@ def test_cli_help():
     assert "sageLLM Benchmark Suite" in result.output
     assert "run" in result.output
     assert "compare" in result.output
+    assert "nonstream-compare" in result.output
     assert "vllm-compare" in result.output
     assert "report" in result.output
 
@@ -74,6 +75,16 @@ def test_compare_requires_multiple_targets():
     )
     assert result.exit_code != 0
     assert "Repeat --target at least twice" in result.output
+
+
+def test_nonstream_compare_help():
+    """Test nonstream-compare subcommand help."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["nonstream-compare", "--help"])
+    assert result.exit_code == 0
+    assert "--target" in result.output
+    assert "--prompt" in result.output
+    assert "--batch-size" in result.output
 
 
 def test_vllm_compare_help():
