@@ -56,6 +56,24 @@ sagellm-benchmark vllm-compare run \
   --sagellm-url http://127.0.0.1:8901/v1 \
   --vllm-url http://127.0.0.1:9100/v1 \
   --model Qwen/Qwen2.5-1.5B-Instruct
+
+# Sequential mode for single-GPU or tight-memory validation
+sagellm-benchmark compare-record \
+  --label sagellm \
+  --url http://127.0.0.1:8901/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --output-dir ./benchmark_results/sequential/sagellm
+
+sagellm-benchmark compare-record \
+  --label vllm \
+  --url http://127.0.0.1:9100/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --output-dir ./benchmark_results/sequential/vllm
+
+sagellm-benchmark compare-offline \
+  --result sagellm=./benchmark_results/sequential/sagellm/sagellm.json \
+  --result vllm=./benchmark_results/sequential/vllm/vllm.json \
+  --output-dir ./benchmark_results/sequential/compare
 ```
 
 如需在 endpoint 缺失时由 benchmark 自动拉起 Dockerized vLLM：
@@ -87,6 +105,27 @@ cd sagellm-benchmark
 
 That's it! Results will be in `./benchmark_results/`
 
+To validate recent `sagellm-core` shared-stream convergence and `sagellm-backend` paged/native convergence against live endpoints:
+
+```bash
+cd sagellm-benchmark
+./run_benchmark.sh --profile convergence \
+  --target before=http://127.0.0.1:8901/v1 \
+  --target after=http://127.0.0.1:8902/v1 \
+  --log-file before=/tmp/sagellm-before.log \
+  --log-file after=/tmp/sagellm-after.log \
+  --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+This profile writes:
+
+- `comparison.json` and `comparison.md`
+- `validation_summary.json` and `VALIDATION.md`
+- `REPRODUCE.sh`
+- `<label>_info.json`
+- `<label>_metrics.prom`
+- `<label>_log_probe.json` when `--log-file` is provided
+
 ### Option 2: Manual CLI
 
 ```bash
@@ -111,6 +150,27 @@ benchmark_results/
 └── REPORT.md                    # Human-readable report
 ```
 
+Convergence profile outputs look like:
+
+```text
+benchmark_results/convergence_YYYYMMDD_HHMMSS/
+├── comparison.json
+├── comparison.md
+├── validation_summary.json
+├── VALIDATION.md
+├── REPRODUCE.sh
+├── before.json
+├── before.md
+├── before_info.json
+├── before_metrics.prom
+├── before_log_probe.json
+├── after.json
+├── after.md
+├── after_info.json
+├── after_metrics.prom
+└── after_log_probe.json
+```
+
 ## Understanding the Output
 
 ### Terminal Output
@@ -133,12 +193,35 @@ Benchmark Results
   - Lower is better
   - Critical for interactive chat
 
+- **TBT (Time Between Tokens)**: Decode-step latency once the first token has arrived
+  - Lower is better
+  - Best field for comparing stateful batch decode convergence
+
 - **Throughput**: Tokens generated per second
   - Higher is better
   - Important for batch processing
 
+- **Output Throughput**: Output tokens per second over the full run
+  - Higher is better
+  - Best field for shared-stream and paged/native convergence comparison
+
 - **Error Rate**: Percentage of failed requests
   - Lower is better
+
+For convergence validation, also inspect the probe fields produced by `validation_summary.json`:
+
+- `shared_stream_markers.hits`: log evidence that shared batching actually activated
+- `paged_path_markers.hits`: log evidence that paged/native or fallback implementation paths were exercised
+- `block_table_markers.hits`: log evidence that scheduler-provided block tables reached the runtime path
+
+### How to map fields back to the mainline architecture
+
+- If `avg_tbt_ms` improves but `block_table_markers.hits` and `paged_path_markers.hits` stay `0`, you only proved a latency change, not that paged KV or native attention mainline was exercised.
+- If `shared_stream_markers.hits` is `0`, do not claim shared-stream convergence even if aggregate throughput improved.
+- If marker hits are present but `avg_tbt_ms` and `output_throughput_tps` do not improve, the path is wired but not yet optimized.
+- Strong convergence evidence means metric deltas and path evidence move together.
+
+Canonical ownership and boundary rules are defined in <https://github.com/intellistream/sagellm-docs/blob/main/docs/specs/performance_mainline_architecture.md>.
 
 ## Backend Options
 
@@ -176,8 +259,27 @@ sagellm-benchmark run --output ./my_results
 # Generate markdown report
 sagellm-benchmark report --format markdown > REPORT.md
 
+# External convergence validation against two live endpoints
+./run_benchmark.sh --profile convergence \
+  --target baseline=http://127.0.0.1:8901/v1 \
+  --target candidate=http://127.0.0.1:8902/v1 \
+  --log-file baseline=/var/log/sagellm-baseline.log \
+  --log-file candidate=/var/log/sagellm-candidate.log \
+  --batch-size 1 --batch-size 2 --batch-size 4 \
+  --model Qwen/Qwen2.5-0.5B-Instruct
+
 # View raw JSON
 sagellm-benchmark report --format json
+```
+
+Ascend-first startup example for a candidate endpoint:
+
+```bash
+cd /home/shuhao/sagellm
+./scripts/sagellm_with_ascend_env.sh sagellm serve \
+  --backend ascend \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --port 8902
 ```
 
 ## Troubleshooting
@@ -243,3 +345,9 @@ sagellm-benchmark report
 ```
 
 That's all you need to get started!
+
+For regression-style endpoint validation, switch to:
+
+```bash
+./run_benchmark.sh --profile convergence --target baseline=http://127.0.0.1:8901/v1 --target candidate=http://127.0.0.1:8902/v1
+```

@@ -15,6 +15,27 @@ Benchmark suite for sageLLM inference engine performance and validation.
 
 New here? See [QUICKSTART.md](QUICKSTART.md) for a 5-minute guide.
 
+Canonical boundary note: performance-path ownership is defined in <https://github.com/intellistream/sagellm-docs/blob/main/docs/specs/performance_mainline_architecture.md>. `sagellm-benchmark` validates the main path externally; it does not define runtime semantics for `sagellm-core`.
+
+## Mainline Validation Mapping
+
+Use benchmark output as proof for the canonical performance mainline, not as a standalone score table.
+
+- `avg_ttft_ms`: admission + prefill responsiveness. Good for spotting whether batching changes hurt interactive startup.
+- `avg_tbt_ms`: decode-step latency on the formal execution path. This is the first field to inspect for `stateful batch decode` convergence.
+- `avg_throughput_tps`: average per-request throughput. Useful for request-level decode efficiency, but not a substitute for aggregate batch throughput.
+- `output_throughput_tps`: best top-line field for shared-stream and paged/native convergence when comparing batch size `>= 2`.
+- `request_throughput_rps`: useful when an optimization changes concurrent admission or batch turnover more than single-request token speed.
+- `shared_stream_markers.hits`: required log evidence that shared batching actually activated.
+- `paged_path_markers.hits`: evidence that paged/native or explicit fallback attention implementations were actually reached.
+- `block_table_markers.hits`: evidence that scheduler-provided `block_tables` crossed the runtime boundary and survived to execution.
+
+Interpretation rule:
+
+- Better `avg_tbt_ms` or `output_throughput_tps` without marker evidence is only a performance observation, not proof that the intended mainline path converged.
+- Marker evidence without competitive latency/throughput means the path is wired, but not yet performant.
+- A valid convergence claim should combine metric deltas with `/info`, `/metrics`, or `*_log_probe.json` evidence.
+
 ## Features
 
 - End-to-end Q1-Q8 query workloads covering diverse LLM scenarios
@@ -23,6 +44,7 @@ New here? See [QUICKSTART.md](QUICKSTART.md) for a 5-minute guide.
 - Extensible backend support
 - Performance benchmark CLI (`perf`) for operator and E2E benchmark baselines
 - Canonical `compare` entrypoint for sagellm vs vllm/lmdeploy endpoint benchmarking
+- Convergence validation profile for shared-stream batching, block-table usage, and paged/native path evidence
 
 ## Dependencies
 
@@ -76,6 +98,24 @@ sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
    --model Qwen/Qwen2.5-0.5B-Instruct
+
+# If GPU memory is tight, capture the two engines sequentially and compare offline.
+sagellm-benchmark compare-record \
+   --label sagellm \
+   --url http://127.0.0.1:8901/v1 \
+   --model Qwen/Qwen2.5-1.5B-Instruct \
+   --output-dir ./benchmark_results/sequential/sagellm
+
+sagellm-benchmark compare-record \
+   --label vllm \
+   --url http://127.0.0.1:9100/v1 \
+   --model Qwen/Qwen2.5-1.5B-Instruct \
+   --output-dir ./benchmark_results/sequential/vllm
+
+sagellm-benchmark compare-offline \
+   --result sagellm=./benchmark_results/sequential/sagellm/sagellm.json \
+   --result vllm=./benchmark_results/sequential/vllm/vllm.json \
+   --output-dir ./benchmark_results/sequential/compare
 
 # In an interactive terminal, compare can also prompt to kill local target
 # processes after the benchmark finishes.
@@ -142,6 +182,101 @@ docker logs sagellm-benchmark-vllm | tail -n 200
 
 # Generate charts (PNG/PDF, dark theme)
 sagellm-benchmark perf --type e2e --plot --plot-format png --plot-format pdf --theme dark
+
+# Keep the default Q1-Q8 CPU flow
+./run_benchmark.sh
+
+# Run the convergence validation loop against two live endpoints
+./run_benchmark.sh --profile convergence \
+   --target before=http://127.0.0.1:8901/v1 \
+   --target after=http://127.0.0.1:8902/v1 \
+   --log-file before=/tmp/sagellm-before.log \
+   --log-file after=/tmp/sagellm-after.log \
+   --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+When validating the mainline architecture rather than just endpoint speed, preserve three artifact classes together:
+
+- compare results: `comparison.json/.md`
+- runtime surfaces: `*_info.json`, `*_metrics.prom`
+- path evidence: `*_log_probe.json`
+
+## Convergence Validation Loop
+
+Use the benchmark repo as the external validation layer for recent `sagellm-core` and `sagellm-backend` convergence work. The convergence profile keeps runtime selection outside `sagellm-core`, then captures both benchmark deltas and endpoint observability snapshots.
+
+Standard result fields to compare:
+
+- `avg_ttft_ms`
+- `avg_tbt_ms`
+- `avg_throughput_tps`
+- `output_throughput_tps`
+- `request_throughput_rps`
+- `shared_stream_markers.hits`
+- `paged_path_markers.hits`
+- `block_table_markers.hits`
+
+Standard artifacts written by `./run_benchmark.sh --profile convergence`:
+
+- `comparison.json` and `comparison.md`
+- `validation_summary.json` and `VALIDATION.md`
+- `REPRODUCE.sh`
+- `<label>.json` and `<label>.md`
+- `<label>_info.json`
+- `<label>_metrics.prom`
+- `<label>_log_probe.json` when `--log-file LABEL=PATH` is provided
+
+Recommended benchmark interpretation:
+
+- Shared-stream batching: compare `avg_ttft_ms`, `avg_tbt_ms`, and `output_throughput_tps` at `--batch-size 2` and `--batch-size 4`, then confirm the candidate endpoint shows non-zero `shared_stream_markers.hits`.
+- Paged/native path usage: inspect `<label>_metrics.prom`, `<label>_info.json`, and `<label>_log_probe.json` for non-zero `paged_path_markers.hits`.
+- Formal block-table path: inspect `<label>_log_probe.json` for non-zero `block_table_markers.hits`, then correlate with the batch-size latency/throughput deltas.
+
+Reproducible command templates:
+
+Shared stream before/after:
+
+```bash
+./run_benchmark.sh --profile convergence \
+   --target before=http://127.0.0.1:8901/v1 \
+   --target after=http://127.0.0.1:8902/v1 \
+   --log-file before=/var/log/sagellm-before.log \
+   --log-file after=/var/log/sagellm-after.log \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --batch-size 1 --batch-size 2 --batch-size 4 \
+   --max-output-tokens 64
+```
+
+Paged/native on vs off:
+
+```bash
+./run_benchmark.sh --profile convergence \
+   --target torch_fallback=http://127.0.0.1:8911/v1 \
+   --target native_ascend=http://127.0.0.1:8912/v1 \
+   --log-file torch_fallback=/var/log/sagellm-fallback.log \
+   --log-file native_ascend=/var/log/sagellm-native.log \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --batch-size 1 --batch-size 2 --batch-size 4 \
+   --max-output-tokens 64
+```
+
+Cross-backend comparison on domestic hardware:
+
+```bash
+./run_benchmark.sh --profile convergence \
+   --target ascend_native=http://127.0.0.1:8921/v1 \
+   --target kunlun_native=http://127.0.0.1:8922/v1 \
+   --target musa_native=http://127.0.0.1:8923/v1 \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --batch-size 1 --batch-size 2 --batch-size 4 \
+   --max-output-tokens 64
+```
+
+On Ascend hosts, start the SageLLM endpoint through the umbrella runtime wrapper before benchmarking:
+
+```bash
+cd /home/shuhao/sagellm
+./scripts/sagellm_with_ascend_env.sh sagellm serve --backend ascend --model Qwen/Qwen2.5-0.5B-Instruct --port 8912
 ```
 
 CLI examples:
@@ -219,6 +354,8 @@ sagellm-benchmark compare \
 - `<target>.json/.md`
 - `comparison.md`（汇总 TTFT/TBT/TPS 差异）
 - `comparison.json`（结构化对比摘要）
+
+如需同时验证 shared-stream batching 与 paged/block-table 路径，优先使用上面的 `run_benchmark.sh --profile convergence`，因为它会额外落盘 `/info`、`/metrics` 和可选日志探针结果。
 
 ## Workloads
 

@@ -7,12 +7,19 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from sagellm_benchmark.cli import main
+from sagellm_benchmark.cli import (
+    _display_perf_e2e_table,
+    _display_results,
+    _format_e2e_markdown,
+    console,
+    main,
+)
 from sagellm_benchmark.nonstream_compare import (
     NonStreamCompareConfig,
     NonStreamTarget,
     run_nonstream_compare,
 )
+from sagellm_benchmark.types import AggregatedMetrics
 
 
 def test_perf_help():
@@ -325,6 +332,110 @@ def test_vllm_compare_run_generates_files(monkeypatch):
         assert [target["label"] for target in payload["targets"]] == ["sagellm", "vllm"]
 
 
+def test_compare_record_generates_files(monkeypatch):
+    """compare-record should write a single target payload for later offline compare."""
+
+    def fake_run_e2e_model_benchmarks(**kwargs):
+        return [
+            {
+                "model": kwargs["models"][0],
+                "precision": "live",
+                "scenario": "short_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "throughput_tps": 100.0,
+                "latency_p50_ms": 20.0,
+                "latency_p95_ms": 25.0,
+                "latency_p99_ms": 30.0,
+                "memory_mb": 0.0,
+                "mode": "live",
+            }
+        ]
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
+        fake_run_e2e_model_benchmarks,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("capture_out")
+        result = runner.invoke(
+            main,
+            [
+                "compare-record",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+        assert result.exit_code == 0
+        assert (output_dir / "sagellm.json").exists()
+        with open(output_dir / "sagellm.json") as f:
+            payload = json.load(f)
+        assert payload["kind"] == "e2e"
+        assert payload["label"] == "sagellm"
+
+
+def test_compare_offline_generates_summary():
+    """compare-offline should merge captured single-target results into comparison artifacts."""
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        input_dir = Path("captures")
+        input_dir.mkdir()
+        for label, ttft, tbt, tps in (
+            ("sagellm", 10.0, 2.0, 100.0),
+            ("vllm", 8.0, 1.0, 120.0),
+        ):
+            payload = {
+                "kind": "e2e",
+                "simulate": False,
+                "mode": "live-compare",
+                "label": label,
+                "url": f"http://127.0.0.1/{label}/v1",
+                "models": ["Qwen/Qwen2.5-0.5B-Instruct"],
+                "batch_sizes": [1, 2, 4],
+                "precisions": ["live"],
+                "summary": {
+                    "total_rows": 1,
+                    "avg_ttft_ms": ttft,
+                    "avg_tbt_ms": tbt,
+                    "avg_throughput_tps": tps,
+                },
+                "rows": [],
+            }
+            with open(input_dir / f"{label}.json", "w") as f:
+                json.dump(payload, f, indent=2)
+
+        output_dir = Path("compare_out")
+        result = runner.invoke(
+            main,
+            [
+                "compare-offline",
+                "--result",
+                f"sagellm={input_dir / 'sagellm.json'}",
+                "--result",
+                f"vllm={input_dir / 'vllm.json'}",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+        assert result.exit_code == 0
+        assert (output_dir / "comparison.json").exists()
+        with open(output_dir / "comparison.json") as f:
+            payload = json.load(f)
+        assert payload["kind"] == "compare"
+        assert payload["baseline"] == "sagellm"
+        assert [target["label"] for target in payload["targets"]] == ["sagellm", "vllm"]
+
+
 def test_compare_passes_target_commands(monkeypatch):
     """compare should forward optional target start commands to the execution layer."""
 
@@ -394,6 +505,56 @@ def test_vllm_compare_run_passes_start_commands(monkeypatch):
         "sagellm": "sagellm serve --port 8901",
         "vllm": "vllm serve --port 8000",
     }
+
+
+def test_display_results_emphasizes_output_throughput() -> None:
+    metrics = AggregatedMetrics(
+        avg_ttft_ms=20.0,
+        avg_tbt_ms=4.0,
+        avg_throughput_tps=80.0,
+        output_throughput_tps=320.0,
+        total_throughput_tps=360.0,
+        input_throughput_tps=40.0,
+        request_throughput_rps=12.0,
+        total_requests=16,
+        failed_requests=0,
+        peak_mem_mb=2048,
+        total_input_tokens=400,
+        total_output_tokens=3200,
+    )
+
+    with console.capture() as capture:
+        _display_results({"sagellm": metrics})
+    output = capture.get()
+
+    assert "Output Throughput" in output
+    assert "320.00 tokens/s" in output
+    assert "Avg Per-Request TPS" in output
+    assert "80.00 tokens/s" in output
+
+
+def test_perf_e2e_summary_emphasizes_output_throughput() -> None:
+    data = {
+        "summary": {
+            "total_rows": 2,
+            "avg_ttft_ms": 12.0,
+            "avg_tbt_ms": 3.0,
+            "avg_throughput_tps": 75.0,
+            "output_throughput_tps": 300.0,
+        },
+        "rows": [],
+    }
+
+    with console.capture() as capture:
+        _display_perf_e2e_table(data)
+    output = capture.get()
+
+    assert "Output Throughput (tok/s): 300.00" in output
+    assert "Avg Per-Request Throughput (tok/s): 75.00" in output
+
+    markdown = _format_e2e_markdown(data)
+    assert "- Output Throughput (tok/s): 300.00" in markdown
+    assert "- Avg Per-Request Throughput (tok/s): 75.00" in markdown
 
 
 def test_compare_prompt_cleanup_kills_local_targets(monkeypatch):

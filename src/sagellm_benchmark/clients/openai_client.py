@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sagellm_benchmark.clients.base import BenchmarkClient
@@ -71,6 +73,7 @@ class GatewayClient(BenchmarkClient):
         self.base_url = base_url
         self.api_key = api_key
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self._tokenizer_cache: dict[str, Any | None] = {}
 
         logger.info(f"OpenAI client initialized: base_url={base_url}")
 
@@ -98,8 +101,7 @@ class GatewayClient(BenchmarkClient):
 
         start_time = time.perf_counter()
         first_token_time = None
-        tokens_received = 0
-        token_times: list[float] = []
+        streamed_chunks = 0
 
         try:
             # Build API request
@@ -123,7 +125,7 @@ class GatewayClient(BenchmarkClient):
                 if chunk.choices and chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
                     output_text += content
-                    tokens_received += 1
+                    streamed_chunks += 1
 
                     if first_token_time is None:
                         first_token_time = current_time
@@ -131,32 +133,28 @@ class GatewayClient(BenchmarkClient):
                             f"TTFT for {request.request_id}: "
                             f"{(first_token_time - start_time) * 1000:.2f}ms"
                         )
-                    else:
-                        token_times.append(current_time)
 
             end_time = time.perf_counter()
 
             # Calculate metrics
             total_time_s = end_time - start_time
             ttft_ms = (first_token_time - start_time) * 1000 if first_token_time else 0.0
+            output_tokens = self._count_text_tokens(output_text, request.model) or streamed_chunks
+            prompt_tokens = self._count_text_tokens(request.prompt, request.model)
+            if prompt_tokens <= 0:
+                prompt_tokens = len(request.prompt.split())
 
-            # Calculate TBT (time between tokens)
-            if len(token_times) > 1:
-                tbt_intervals = [
-                    (token_times[i] - token_times[i - 1]) * 1000 for i in range(1, len(token_times))
-                ]
-                tbt_ms = sum(tbt_intervals) / len(tbt_intervals)
+            # Calculate TBT using real output token count when available.
+            if first_token_time is not None and output_tokens > 1:
+                tbt_ms = ((end_time - first_token_time) * 1000) / (output_tokens - 1)
             else:
                 tbt_ms = 0.0
 
             # TPOT (time per output token)
-            tpot_ms = (total_time_s * 1000 / tokens_received) if tokens_received > 0 else 0.0
+            tpot_ms = (total_time_s * 1000 / output_tokens) if output_tokens > 0 else 0.0
 
             # Throughput
-            throughput_tps = tokens_received / total_time_s if total_time_s > 0 else 0.0
-
-            # Estimate prompt tokens (rough)
-            prompt_tokens = len(request.prompt.split())
+            throughput_tps = output_tokens / total_time_s if total_time_s > 0 else 0.0
 
             # Create metrics (OpenAI API doesn't provide all metrics)
             metrics = Metrics(
@@ -181,7 +179,7 @@ class GatewayClient(BenchmarkClient):
                 error=None,
                 metrics=metrics,
                 output_text=output_text,
-                output_tokens=tokens_received,
+                output_tokens=output_tokens,
                 prompt_tokens=prompt_tokens,
             )
 
@@ -193,6 +191,94 @@ class GatewayClient(BenchmarkClient):
                 error=str(e),
                 metrics=None,
             )
+
+    def _count_text_tokens(self, text: str, model_id: str) -> int:
+        """Count real tokenizer tokens for benchmark accounting when tokenizer is available."""
+        if not text:
+            return 0
+        tokenizer = self._get_tokenizer(model_id)
+        if tokenizer is None:
+            return 0
+        try:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            token_ids = tokenizer.encode(text)
+        return len(token_ids)
+
+    def _get_tokenizer(self, model_id: str) -> Any | None:
+        """Lazily load and cache a tokenizer for accurate token accounting.
+
+        Uses local/cache-only lookup to avoid hidden network dependency in benchmark runs.
+        """
+        if not model_id:
+            return None
+        if model_id in self._tokenizer_cache:
+            return self._tokenizer_cache[model_id]
+
+        try:
+            from transformers import AutoTokenizer
+        except ImportError:
+            logger.warning(
+                "transformers not available; falling back to streamed chunk counts for model=%s",
+                model_id,
+            )
+            self._tokenizer_cache[model_id] = None
+            return None
+
+        tokenizer_source, local_only = self._resolve_tokenizer_source(model_id)
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_source,
+                trust_remote_code=True,
+                local_files_only=local_only,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Tokenizer unavailable for model=%s source=%s local_only=%s; "
+                "falling back to streamed chunk counts: %s",
+                model_id,
+                tokenizer_source,
+                local_only,
+                exc,
+            )
+            tokenizer = None
+
+        self._tokenizer_cache[model_id] = tokenizer
+        return tokenizer
+
+    @staticmethod
+    def _resolve_tokenizer_source(model_id: str) -> tuple[str, bool]:
+        """Resolve the tokenizer source for benchmark token accounting.
+
+        Priority:
+        1. Explicit local model directory env vars.
+        2. Direct filesystem path in ``model_id``.
+        3. Conventional local cache under ``~/.cache/hf-local-models``.
+        4. Remote model id via HuggingFace mirror / configured endpoint.
+        """
+        explicit_local_dir = (
+            os.getenv("SAGELLM_BENCHMARK_LOCAL_MODEL_DIR")
+            or os.getenv("VLLM_LOCAL_MODEL_DIR")
+            or os.getenv("HF_LOCAL_MODEL_DIR")
+        )
+        if explicit_local_dir and os.path.exists(explicit_local_dir):
+            return explicit_local_dir, True
+
+        if os.path.exists(model_id):
+            return model_id, True
+
+        normalized = model_id.strip().strip("/")
+        model_leaf = normalized.split("/")[-1] if normalized else model_id
+        local_cache_candidates = [
+            Path.home() / ".cache" / "hf-local-models" / model_leaf,
+            Path.home() / ".cache" / "hf-local-models" / normalized,
+        ]
+        for candidate in local_cache_candidates:
+            if candidate.exists():
+                return str(candidate), True
+
+        return model_id, False
 
     async def health_check(self, timeout: float = 5.0) -> bool:
         """Check if API is reachable.

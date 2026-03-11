@@ -60,6 +60,23 @@ def test_compare_help():
     assert "--batch-size" in result.output
 
 
+def test_compare_record_help():
+    """Test compare-record subcommand help."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["compare-record", "--help"])
+    assert result.exit_code == 0
+    assert "--label" in result.output
+    assert "--url" in result.output
+
+
+def test_compare_offline_help():
+    """Test compare-offline subcommand help."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["compare-offline", "--help"])
+    assert result.exit_code == 0
+    assert "--result" in result.output
+
+
 def test_compare_requires_multiple_targets():
     """Compare should require at least two targets."""
     runner = CliRunner()

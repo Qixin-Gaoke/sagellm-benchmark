@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `run_benchmark.sh` 的 `convergence` profile 现改为向 `sagellm-benchmark compare` 传递正确的 `--server-wait` 参数，避免 live compare 在启动前因错误选项名 `--server-wait-s` 直接失败，确保 `comparison.json/.md`、`validation_summary.json` 和 `VALIDATION.md` 能正常生成。
+- `run_benchmark.sh` 的 probe 采集现支持在 endpoint 不提供 `/info` 时自动回退抓取 `/v1/models`，并在 `validation_summary.json` / `VALIDATION.md` 中显式标出 `probe_coverage` 与 `evidence_gaps`，避免 `vLLM` 或轻量服务缺少 `/info` 时出现无解释的证据空洞。
+- `run_benchmark.sh` 的 convergence 汇总现在会直接扫描 `*_info.json` / `*_models.json` / `*_metrics.prom` 中的 shared-stream、paged-path、block-table 主路径信号，并将结果写入 `runtime_surface_markers`。即使没有服务日志文件，也能从 runtime surfaces 判断证据覆盖度，而不是把所有 marker 一律视作缺失。
+
+### Added
+- `run_benchmark.sh` 新增 `convergence` profile：可对多个 OpenAI-compatible endpoints 执行 live compare，并自动落盘 `comparison.json/.md`、`validation_summary.json`、`VALIDATION.md`、`REPRODUCE.sh`、`*_info.json`、`*_metrics.prom` 以及可选 `*_log_probe.json`，用于验证 shared-stream batching、paged/native attention 和 block-table 主路径是否真正命中。
+- 新增 `compare-record` 与 `compare-offline` CLI：前者用于单 endpoint 顺序采集 `<label>.json/.md`，后者把多份采集结果离线合并为标准 `comparison.json/.md`，允许在显存紧张时不同时启动两个引擎也能完成 sagellm vs vllm 对比。
+
 ### Changed
+- README 与 QUICKSTART 现补充“指标字段 -> 主路径语义”映射，明确 `avg_tbt_ms`、`output_throughput_tps`、`shared_stream_markers.hits`、`paged_path_markers.hits`、`block_table_markers.hits` 应如何组合解读，避免只看 latency/throughput 就误判为主路径已收敛。
+- README 与 QUICKSTART 现在提供面向国产硬件优化收敛的标准 benchmark/validation 闭环，明确推荐比较字段：`avg_ttft_ms`、`avg_tbt_ms`、`avg_throughput_tps`、`output_throughput_tps`、`request_throughput_rps`、`shared_stream_markers.hits`、`paged_path_markers.hits`、`block_table_markers.hits`，并给出 shared-stream before/after、paged/native on/off、跨后端硬件对比的可复现命令模板。
+- benchmark OpenAI client 现在会优先从 `SAGELLM_BENCHMARK_LOCAL_MODEL_DIR` / `VLLM_LOCAL_MODEL_DIR` / `HF_LOCAL_MODEL_DIR` 和 `~/.cache/hf-local-models/<model>` 解析 tokenizer；只有本地目录不存在时才回退到 HuggingFace repo id，并默认把 `HF_ENDPOINT` 补为 `https://hf-mirror.com`，减少 live compare 时对 `huggingface.co` 的意外探测与超时噪音。
+- OpenAI-compatible benchmark client (`GatewayClient`) 现在优先使用请求模型对应的 tokenizer 对完整输出文本做真实 token 计数，并据此计算 `output_tokens` / `prompt_tokens` / `tpot_ms` / `throughput_tps`；不再把 SSE stream chunk 数误当成 token 数。若本地/cached tokenizer 不可用，会显式回退到 chunk 计数并记录 warning。
+- benchmark CLI 的 live/compare 默认展示现在突出 `output_throughput_tps`（更接近 vLLM/SGLang 常见 offline throughput 口径），并把 `avg_throughput_tps` 明确标注为 `Avg Per-Request Throughput`，减少把端到端单请求 TPS 误读成批量总吞吐的风险。
 - CUDA Docker vLLM helper 现在支持 `DOCKER_CMD` 覆盖容器命令，并支持通过 `VLLM_LOCAL_MODEL_DIR` / `VLLM_SERVED_MODEL_NAME` 挂载宿主机本地模型目录后离线启动容器，避免 A100 机器上 vLLM 容器在启动阶段直连 `huggingface.co` 超时。
 - 删除 `scripts/compare_openai_endpoints.sh` 这类纯兼容 compare wrapper，统一收口到 `sagellm-benchmark compare` / `sagellm-benchmark vllm-compare run`，避免旧 shell 入口继续制造参数顺序与 cleanup 行为歧义。
 - CUDA benchmark workflow: recommend running vLLM in a dedicated NVIDIA Docker container via `scripts/start_vllm_cuda_docker.sh` / `scripts/stop_vllm_cuda_docker.sh`, defaulting to `--network host` and preserved failure logs so repeated `sagellm-benchmark compare` runs can reuse a stable vLLM endpoint instead of reinstalling host-side wheels.

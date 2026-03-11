@@ -72,6 +72,23 @@ def _parse_label_command(spec: str) -> tuple[str, str]:
     return label, command
 
 
+def _parse_label_path(spec: str) -> tuple[str, str]:
+    """Parse a LABEL=PATH mapping."""
+    if "=" not in spec:
+        raise click.BadParameter(
+            f"Invalid result mapping '{spec}'. Expected LABEL=PATH, for example sagellm=./results/sagellm.json"
+        )
+
+    label, path = spec.split("=", 1)
+    label = label.strip()
+    path = path.strip()
+    if not label or not path:
+        raise click.BadParameter(
+            f"Invalid result mapping '{spec}'. Both label and path are required in LABEL=PATH format."
+        )
+    return label, path
+
+
 def _build_compare_summary(target_results: list[dict[str, object]]) -> dict[str, object]:
     """Build a comparison summary using the first target as baseline."""
     if not target_results:
@@ -141,6 +158,122 @@ def _format_compare_markdown(compare_result: dict[str, object]) -> str:
         lines.append(f"- {target['label']}: {target['url']}")
 
     return "\n".join(lines)
+
+
+def _run_compare_target(
+    *,
+    label: str,
+    url: str,
+    model: str,
+    batch_sizes: tuple[int, ...],
+    api_key: str,
+    request_timeout: float,
+    server_wait_s: float,
+    max_seq_len: int | None,
+    max_output_tokens: int | None,
+    output_dir: Path,
+) -> dict[str, object]:
+    """Run a single live compare target and write per-target artifacts."""
+    from sagellm_benchmark.performance.model_benchmarks import (
+        run_e2e_model_benchmarks,
+        summarize_e2e_rows,
+    )
+
+    rows = run_e2e_model_benchmarks(
+        models=[model],
+        batch_sizes=list(batch_sizes),
+        precisions=["live"],
+        simulate=False,
+        backend_url=url,
+        api_key=api_key,
+        request_timeout=request_timeout,
+        server_wait_s=server_wait_s,
+        max_seq_len=max_seq_len,
+        max_output_tokens=max_output_tokens,
+    )
+    summary = summarize_e2e_rows(rows)
+    payload = {
+        "kind": "e2e",
+        "simulate": False,
+        "mode": "live-compare",
+        "label": label,
+        "url": url,
+        "models": [model],
+        "batch_sizes": list(batch_sizes),
+        "precisions": ["live"],
+        "summary": summary,
+        "rows": rows,
+    }
+
+    file_stem = _slugify_filename(label)
+    json_path = output_dir / f"{file_stem}.json"
+    md_path = output_dir / f"{file_stem}.md"
+
+    with open(json_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    with open(md_path, "w") as f:
+        f.write(_format_e2e_markdown(payload) + "\n")
+
+    return {
+        "label": label,
+        "url": url,
+        "summary": summary,
+        "json": str(json_path),
+        "markdown": str(md_path),
+        "payload": payload,
+    }
+
+
+def _write_compare_summary_artifacts(
+    *,
+    compare_output_dir: Path,
+    model: str,
+    batch_sizes: list[int],
+    target_results: list[dict[str, object]],
+) -> dict[str, object]:
+    """Write comparison summary artifacts from precomputed target results."""
+    compare_result = {
+        "kind": "compare",
+        "model": model,
+        "batch_sizes": batch_sizes,
+        **_build_compare_summary(target_results),
+    }
+
+    comparison_json = compare_output_dir / "comparison.json"
+    comparison_md = compare_output_dir / "comparison.md"
+    with open(comparison_json, "w") as f:
+        json.dump(compare_result, f, indent=2)
+    with open(comparison_md, "w") as f:
+        f.write(_format_compare_markdown(compare_result) + "\n")
+
+    return compare_result
+
+
+def _load_compare_result_payload(label: str, path: str) -> dict[str, object]:
+    """Load a single-target compare result payload for offline comparison."""
+    result_path = Path(path)
+    if not result_path.is_file():
+        raise click.ClickException(f"Result file not found: {result_path}")
+
+    with open(result_path) as f:
+        payload = json.load(f)
+
+    if payload.get("kind") != "e2e":
+        raise click.ClickException(
+            f"Result file must contain an e2e payload produced by compare-record or compare: {result_path}"
+        )
+    if "summary" not in payload:
+        raise click.ClickException(f"Result file is missing summary: {result_path}")
+
+    file_label = str(payload.get("label") or label)
+    if not file_label:
+        raise click.ClickException(
+            f"Result file is missing label and none was provided in LABEL=PATH: {result_path}"
+        )
+
+    payload["label"] = file_label
+    payload["url"] = str(payload.get("url") or "offline-captured")
+    return payload
 
 
 def _create_compare_output_dir(output_dir: str | None, prefix: str = "compare") -> Path:
@@ -547,77 +680,38 @@ def _run_compare_command(
     console.print(f"Targets: {len(parsed_targets)}")
     console.print(f"Output: {compare_output_dir}\n")
 
-    from sagellm_benchmark.performance.model_benchmarks import (
-        run_e2e_model_benchmarks,
-        summarize_e2e_rows,
-    )
-
     target_results: list[dict[str, object]] = []
 
     for label, url in parsed_targets:
         console.print(f"[bold]Running target:[/bold] {label} -> {url}")
-        rows = run_e2e_model_benchmarks(
-            models=[model],
-            batch_sizes=list(batch_sizes),
-            precisions=["live"],
-            simulate=False,
-            backend_url=url,
+        target_result = _run_compare_target(
+            label=label,
+            url=url,
+            model=model,
+            batch_sizes=batch_sizes,
             api_key=api_key,
             request_timeout=request_timeout,
             server_wait_s=server_wait_s,
             max_seq_len=max_seq_len,
             max_output_tokens=max_output_tokens,
+            output_dir=compare_output_dir,
         )
-        summary = summarize_e2e_rows(rows)
-        payload = {
-            "kind": "e2e",
-            "simulate": False,
-            "mode": "live-compare",
-            "label": label,
-            "url": url,
-            "models": [model],
-            "batch_sizes": list(batch_sizes),
-            "precisions": ["live"],
-            "summary": summary,
-            "rows": rows,
-        }
-
-        file_stem = _slugify_filename(label)
-        json_path = compare_output_dir / f"{file_stem}.json"
-        md_path = compare_output_dir / f"{file_stem}.md"
-
-        with open(json_path, "w") as f:
-            json.dump(payload, f, indent=2)
-        with open(md_path, "w") as f:
-            f.write(_format_e2e_markdown(payload) + "\n")
-
-        target_results.append(
-            {
-                "label": label,
-                "url": url,
-                "summary": summary,
-                "json": str(json_path),
-                "markdown": str(md_path),
-            }
-        )
+        target_results.append(target_result)
+        summary = target_result["summary"]
         console.print(
             f"[green]✓[/green] {label}: TTFT={summary['avg_ttft_ms']:.2f}ms, "
             f"TBT={summary['avg_tbt_ms']:.2f}ms, TPS={summary['avg_throughput_tps']:.2f}"
         )
 
-    compare_result = {
-        "kind": "compare",
-        "model": model,
-        "batch_sizes": list(batch_sizes),
-        **_build_compare_summary(target_results),
-    }
+    _write_compare_summary_artifacts(
+        compare_output_dir=compare_output_dir,
+        model=model,
+        batch_sizes=list(batch_sizes),
+        target_results=target_results,
+    )
 
     comparison_json = compare_output_dir / "comparison.json"
     comparison_md = compare_output_dir / "comparison.md"
-    with open(comparison_json, "w") as f:
-        json.dump(compare_result, f, indent=2)
-    with open(comparison_md, "w") as f:
-        f.write(_format_compare_markdown(compare_result) + "\n")
 
     console.print("\n[bold green]✓ Compare completed[/bold green]")
     console.print(f"Comparison JSON: {comparison_json}")
@@ -856,6 +950,182 @@ def collect_installed_versions() -> dict[str, str]:
 def main() -> None:
     """sageLLM Benchmark Suite - M1 Demo Contract Validation."""
     pass
+
+
+@main.command("compare-record")
+@click.option("--label", required=True, help="Label for this target capture, e.g. sagellm.")
+@click.option("--url", required=True, help="OpenAI-compatible endpoint URL to benchmark.")
+@click.option(
+    "--model",
+    type=str,
+    default="Qwen/Qwen2.5-0.5B-Instruct",
+    show_default=True,
+    help="Requested model name for the benchmark run.",
+)
+@click.option(
+    "--batch-size",
+    "batch_sizes",
+    multiple=True,
+    type=int,
+    default=(1, 2, 4),
+    show_default=True,
+    help="Batch sizes to benchmark. Repeat for multiple values.",
+)
+@click.option(
+    "--api-key",
+    type=str,
+    default="sagellm-benchmark",
+    show_default=True,
+    help="API key used for the endpoint.",
+)
+@click.option(
+    "--request-timeout",
+    type=float,
+    default=120.0,
+    show_default=True,
+    help="Per-request timeout in seconds.",
+)
+@click.option(
+    "--server-wait",
+    "server_wait_s",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Max seconds to wait for the endpoint to become ready.",
+)
+@click.option(
+    "--max-seq-len",
+    type=int,
+    default=None,
+    help="Override the detected maximum sequence length.",
+)
+@click.option(
+    "--max-output-tokens",
+    type=int,
+    default=64,
+    show_default=True,
+    help="Hard cap on output tokens for each request.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help="Directory to save per-target artifacts (default: benchmark_results/compare-record_<timestamp>).",
+)
+def compare_record(
+    label: str,
+    url: str,
+    model: str,
+    batch_sizes: tuple[int, ...],
+    api_key: str,
+    request_timeout: float,
+    server_wait_s: float,
+    max_seq_len: int | None,
+    max_output_tokens: int | None,
+    output_dir: str | None,
+) -> None:
+    """Capture a single target's live benchmark result for later offline comparison."""
+    compare_output_dir = _create_compare_output_dir(output_dir, prefix="compare-record")
+    compare_output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print("[bold cyan]sageLLM Compare Record[/bold cyan]")
+    console.print(f"Label: {label}")
+    console.print(f"URL: {url}")
+    console.print(f"Model: {model}")
+    console.print(f"Output: {compare_output_dir}\n")
+
+    target_result = _run_compare_target(
+        label=label,
+        url=url,
+        model=model,
+        batch_sizes=batch_sizes,
+        api_key=api_key,
+        request_timeout=request_timeout,
+        server_wait_s=server_wait_s,
+        max_seq_len=max_seq_len,
+        max_output_tokens=max_output_tokens,
+        output_dir=compare_output_dir,
+    )
+    summary = target_result["summary"]
+
+    console.print(
+        f"[green]✓[/green] {label}: TTFT={summary['avg_ttft_ms']:.2f}ms, "
+        f"TBT={summary['avg_tbt_ms']:.2f}ms, TPS={summary['avg_throughput_tps']:.2f}"
+    )
+    console.print(f"JSON: {target_result['json']}")
+    console.print(f"Markdown: {target_result['markdown']}")
+
+
+@main.command("compare-offline")
+@click.option(
+    "--result",
+    "results",
+    multiple=True,
+    required=True,
+    help=(
+        "Captured result in LABEL=PATH format. Repeat to compare multiple offline captures, "
+        "e.g. --result sagellm=./captures/sagellm.json --result vllm=./captures/vllm.json"
+    ),
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help="Directory to save offline comparison artifacts (default: benchmark_results/compare_<timestamp>).",
+)
+def compare_offline(results: tuple[str, ...], output_dir: str | None) -> None:
+    """Build comparison artifacts from previously captured single-target results."""
+    if len(results) < 2:
+        raise click.BadParameter("Repeat --result at least twice to compare multiple captures.")
+
+    parsed_results = [_parse_label_path(spec) for spec in results]
+    target_results: list[dict[str, object]] = []
+    models_seen: list[str] = []
+    batch_sizes_seen: list[list[int]] = []
+
+    for label, path in parsed_results:
+        payload = _load_compare_result_payload(label, path)
+        models = payload.get("models") or []
+        batch_sizes = payload.get("batch_sizes") or []
+        model_name = str(models[0]) if models else "unknown"
+        models_seen.append(model_name)
+        batch_sizes_seen.append([int(size) for size in batch_sizes])
+        target_results.append(
+            {
+                "label": payload["label"],
+                "url": payload["url"],
+                "summary": payload["summary"],
+                "json": str(Path(path)),
+                "markdown": str(Path(path).with_suffix(".md")),
+            }
+        )
+
+    if len(set(models_seen)) != 1:
+        raise click.ClickException(
+            f"Offline compare requires the same model across captures, got: {sorted(set(models_seen))}"
+        )
+    normalized_batch_sizes = {tuple(sizes) for sizes in batch_sizes_seen}
+    if len(normalized_batch_sizes) != 1:
+        raise click.ClickException(
+            f"Offline compare requires the same batch sizes across captures, got: {sorted(normalized_batch_sizes)}"
+        )
+
+    compare_output_dir = _create_compare_output_dir(output_dir)
+    compare_output_dir.mkdir(parents=True, exist_ok=True)
+    compare_result = _write_compare_summary_artifacts(
+        compare_output_dir=compare_output_dir,
+        model=models_seen[0],
+        batch_sizes=list(next(iter(normalized_batch_sizes))),
+        target_results=target_results,
+    )
+
+    comparison_json = compare_output_dir / "comparison.json"
+    comparison_md = compare_output_dir / "comparison.md"
+    console.print("[bold cyan]sageLLM Offline Compare[/bold cyan]")
+    console.print(f"Baseline: {compare_result['baseline']}")
+    console.print(f"Targets: {len(target_results)}")
+    console.print(f"Comparison JSON: {comparison_json}")
+    console.print(f"Comparison Markdown: {comparison_md}")
 
 
 @main.command()
@@ -1891,7 +2161,10 @@ def _display_perf_e2e_table(data: dict) -> None:
     console.print(f"Rows: {summary.get('total_rows', 0)}")
     console.print(f"Avg TTFT (ms): {summary.get('avg_ttft_ms', 0.0):.2f}")
     console.print(f"Avg TBT (ms): {summary.get('avg_tbt_ms', 0.0):.2f}")
-    console.print(f"Avg Throughput (tok/s): {summary.get('avg_throughput_tps', 0.0):.2f}\n")
+    console.print(f"Output Throughput (tok/s): {summary.get('output_throughput_tps', 0.0):.2f}")
+    console.print(
+        f"Avg Per-Request Throughput (tok/s): {summary.get('avg_throughput_tps', 0.0):.2f}\n"
+    )
 
     table = Table(title="E2E Scenario Results")
     table.add_column("Model", style="cyan")
@@ -1926,7 +2199,8 @@ def _format_e2e_markdown(data: dict) -> str:
         f"- Rows: {summary.get('total_rows', 0)}",
         f"- Avg TTFT (ms): {summary.get('avg_ttft_ms', 0.0):.2f}",
         f"- Avg TBT (ms): {summary.get('avg_tbt_ms', 0.0):.2f}",
-        f"- Avg Throughput (tok/s): {summary.get('avg_throughput_tps', 0.0):.2f}",
+        f"- Output Throughput (tok/s): {summary.get('output_throughput_tps', 0.0):.2f}",
+        f"- Avg Per-Request Throughput (tok/s): {summary.get('avg_throughput_tps', 0.0):.2f}",
         "",
         "## Results",
         "",
@@ -1974,7 +2248,7 @@ def _display_results(results: dict) -> None:
     table.add_column("Errors", justify="right", style="red")
     table.add_column("Avg TTFT (ms)", justify="right")
     table.add_column("Avg TBT (ms)", justify="right")
-    table.add_column("Throughput (tok/s)", justify="right")
+    table.add_column("Output TPS", justify="right")
     table.add_column("Peak Mem (MB)", justify="right")
 
     for name, metrics in results.items():
@@ -1984,7 +2258,7 @@ def _display_results(results: dict) -> None:
             str(metrics.failed_requests),
             f"{metrics.avg_ttft_ms:.2f}",
             f"{metrics.avg_tbt_ms:.2f}",
-            f"{metrics.avg_throughput_tps:.2f}",
+            f"{metrics.output_throughput_tps:.2f}",
             str(metrics.peak_mem_mb),
         )
 
@@ -1995,10 +2269,11 @@ def _display_results(results: dict) -> None:
 
     for name, metrics in results.items():
         console.print(f"\n[bold]{name}:[/bold]")
-        console.print(f"  Request Throughput:  {metrics.request_throughput_rps:>8.2f} req/s")
-        console.print(f"  Input Throughput:    {metrics.input_throughput_tps:>8.2f} tokens/s")
         console.print(f"  Output Throughput:   {metrics.output_throughput_tps:>8.2f} tokens/s")
+        console.print(f"  Avg Per-Request TPS: {metrics.avg_throughput_tps:>8.2f} tokens/s")
         console.print(f"  Total Throughput:    {metrics.total_throughput_tps:>8.2f} tokens/s")
+        console.print(f"  Input Throughput:    {metrics.input_throughput_tps:>8.2f} tokens/s")
+        console.print(f"  Request Throughput:  {metrics.request_throughput_rps:>8.2f} req/s")
         console.print(f"  Total Input Tokens:  {metrics.total_input_tokens:>8d}")
         console.print(f"  Total Output Tokens: {metrics.total_output_tokens:>8d}")
 

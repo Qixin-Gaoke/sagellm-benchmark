@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from dataclasses import dataclass
 from hashlib import sha256
@@ -190,11 +191,25 @@ async def _discover_max_seq_len(
     try:
         from transformers import AutoConfig  # type: ignore[import-untyped]
 
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        from sagellm_benchmark.clients.openai_client import GatewayClient
+
+        config_source, local_only = GatewayClient._resolve_tokenizer_source(model_path)
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        cfg = AutoConfig.from_pretrained(
+            config_source,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
         for attr in ("max_position_embeddings", "n_positions", "max_sequence_length"):
             val = getattr(cfg, attr, None)
             if isinstance(val, int) and val > 0:
-                logger.info(f"Discovered max_seq_len={val} from AutoConfig.{attr}")
+                logger.info(
+                    "Discovered max_seq_len=%s from AutoConfig.%s source=%s local_only=%s",
+                    val,
+                    attr,
+                    config_source,
+                    local_only,
+                )
                 return val
     except Exception as e:
         logger.debug(f"AutoConfig max_seq_len probe failed: {e}")

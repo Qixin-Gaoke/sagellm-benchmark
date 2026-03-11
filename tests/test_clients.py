@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from test_helpers import StubClient
 
 from sagellm_benchmark.clients import BenchmarkClient
+from sagellm_benchmark.clients.openai_client import GatewayClient
 from sagellm_benchmark.types import BenchmarkRequest
 
 
@@ -330,3 +336,159 @@ async def test_simulated_itl_in_metrics() -> None:
 
     # BenchmarkResult 和 Metrics 中的 itl_list 应该相同
     assert result.itl_list == result.metrics.itl_list
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_counts_real_tokens_not_stream_chunks(monkeypatch) -> None:
+    class _FakeTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            return [index for index, char in enumerate(text) if not char.isspace()]
+
+    class _FakeChunk:
+        def __init__(self, content: str) -> None:
+            self.choices = [SimpleNamespace(delta=SimpleNamespace(content=content))]
+
+    class _FakeStream:
+        def __init__(self, chunks: list[str]) -> None:
+            self._chunks = chunks
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index >= len(self._chunks):
+                raise StopAsyncIteration
+            chunk = _FakeChunk(self._chunks[self._index])
+            self._index += 1
+            return chunk
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            del kwargs
+            return _FakeStream(["He", "llo"])
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    perf_times = iter([10.0, 10.05, 10.08, 10.10])
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=_FakeAsyncOpenAI))
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: _FakeTokenizer())
+        ),
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.time.perf_counter",
+        lambda: next(perf_times),
+    )
+
+    client = GatewayClient(base_url="http://127.0.0.1:8000/v1")
+    request = BenchmarkRequest(
+        prompt="Hi all",
+        max_tokens=8,
+        request_id="gateway-001",
+        model="/tmp/local-model",
+    )
+
+    result = await client.generate(request)
+
+    assert result.success is True
+    assert result.output_text == "Hello"
+    assert result.output_tokens == 5
+    assert result.prompt_tokens == 5
+    assert result.metrics is not None
+    assert result.metrics.ttft_ms == pytest.approx(50.0)
+    assert result.metrics.tbt_ms == pytest.approx(12.5)
+    assert result.metrics.tpot_ms == pytest.approx(20.0)
+    assert result.metrics.throughput_tps == pytest.approx(50.0)
+
+
+def test_gateway_client_prefers_explicit_local_model_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_LOCAL_MODEL_DIR", "/tmp/local-model-dir")
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.os.path.exists",
+        lambda path: path == "/tmp/local-model-dir",
+    )
+
+    source, local_only = GatewayClient._resolve_tokenizer_source("Qwen/Qwen2.5-1.5B-Instruct")
+
+    assert source == "/tmp/local-model-dir"
+    assert local_only is True
+
+
+def test_gateway_client_falls_back_to_local_hf_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    home = Path("/home/tester")
+    monkeypatch.delenv("VLLM_LOCAL_MODEL_DIR", raising=False)
+    monkeypatch.delenv("SAGELLM_BENCHMARK_LOCAL_MODEL_DIR", raising=False)
+    monkeypatch.delenv("HF_LOCAL_MODEL_DIR", raising=False)
+    monkeypatch.setattr("sagellm_benchmark.clients.openai_client.Path.home", lambda: home)
+
+    expected = home / ".cache" / "hf-local-models" / "Qwen2.5-1.5B-Instruct"
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.Path.exists",
+        lambda self: self == expected,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.os.path.exists",
+        lambda path: False,
+    )
+
+    source, local_only = GatewayClient._resolve_tokenizer_source("Qwen/Qwen2.5-1.5B-Instruct")
+
+    assert source == str(expected)
+    assert local_only is True
+
+
+def test_gateway_client_remote_tokenizer_defaults_to_hf_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeTokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return [1]
+
+    def _from_pretrained(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        captured["hf_endpoint"] = os.environ.get("HF_ENDPOINT")
+        return _FakeTokenizer()
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.Path.home", lambda: Path("/no-local-cache")
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.Path.exists",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.clients.openai_client.os.path.exists",
+        lambda path: False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=_from_pretrained)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(AsyncOpenAI=lambda **kwargs: SimpleNamespace()),
+    )
+
+    client = GatewayClient(base_url="http://127.0.0.1:8000/v1")
+    tokenizer = client._get_tokenizer("Qwen/Qwen2.5-1.5B-Instruct")
+
+    assert tokenizer is not None
+    assert captured["args"] == ("Qwen/Qwen2.5-1.5B-Instruct",)
+    assert captured["kwargs"] == {"trust_remote_code": True, "local_files_only": False}
+    assert captured["hf_endpoint"] == "https://hf-mirror.com"
