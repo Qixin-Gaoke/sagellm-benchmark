@@ -47,13 +47,13 @@ class CoreDecodeBatchSummary(_CompatModel):
 class CoreDecodeTelemetrySummary(_CompatModel):
     """Top-level summary over normalized core decode telemetry."""
 
-    step_records: int = Field(ge=0)
-    unique_requests: int = Field(ge=0)
+    step_records: int = Field(default=0, ge=0)
+    unique_requests: int = Field(default=0, ge=0)
     batch_sizes: list[int] = Field(default_factory=list)
     selected_implementations: list[str] = Field(default_factory=list)
     selected_operator_packs: list[str] = Field(default_factory=list)
-    avg_step_latency_ms: float = Field(ge=0.0)
-    max_step_latency_ms: float = Field(ge=0.0)
+    avg_step_latency_ms: float = Field(default=0.0, ge=0.0)
+    max_step_latency_ms: float = Field(default=0.0, ge=0.0)
     by_batch_size: list[CoreDecodeBatchSummary] = Field(default_factory=list)
 
 
