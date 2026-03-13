@@ -57,6 +57,7 @@ def test_compare_help():
     assert result.exit_code == 0
     assert "--target" in result.output
     assert "--model" in result.output
+    assert "--hardware-family" in result.output
     assert "--batch-size" in result.output
 
 
@@ -67,6 +68,17 @@ def test_compare_record_help():
     assert result.exit_code == 0
     assert "--label" in result.output
     assert "--url" in result.output
+    assert "--hardware-family" in result.output
+
+
+def test_validate_serving_consistency_help():
+    """Test validate-serving-consistency subcommand help."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["validate-serving-consistency", "--help"])
+    assert result.exit_code == 0
+    assert "--reference-artifact" in result.output
+    assert "--batch-size" in result.output
+    assert "--hardware-family" in result.output
 
 
 def test_compare_offline_help():
@@ -88,6 +100,8 @@ def test_compare_requires_multiple_targets():
             "sagellm=http://127.0.0.1:8000/v1",
             "--model",
             "Qwen/Qwen2.5-0.5B-Instruct",
+            "--hardware-family",
+            "cuda",
         ],
     )
     assert result.exit_code != 0
@@ -120,7 +134,17 @@ def test_vllm_compare_run_help():
     assert result.exit_code == 0
     assert "--vllm-url" in result.output
     assert "--sagellm-url" in result.output
+    assert "--hardware-family" in result.output
     assert "--batch-size" in result.output
+
+
+def test_parity_gate_convert_core_telemetry_help() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["parity-gate", "convert-core-telemetry", "--help"])
+    assert result.exit_code == 0
+    assert "--input-json" in result.output
+    assert "--label" in result.output
+    assert "--hardware-family" in result.output
 
 
 def test_vllm_compare_install_ascend_invokes_expected_steps(monkeypatch, tmp_path):

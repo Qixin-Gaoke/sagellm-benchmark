@@ -8,6 +8,25 @@ from sagellm_benchmark._version import __version__
 from sagellm_benchmark.clients import (
     BenchmarkClient,
 )
+from sagellm_benchmark.core_telemetry import (
+    CoreDecodeStepTelemetryRecord,
+    CoreDecodeTelemetryArtifact,
+    CoreDecodeTelemetrySummary,
+    build_core_decode_telemetry_artifact,
+    extract_explicit_decode_snapshot,
+    load_core_decode_telemetry_input,
+)
+from sagellm_benchmark.parity_gate import (
+    DecodeParityGate,
+    DecodeParityScenario,
+    DecodeParityThresholds,
+    GateFailureCategory,
+    ParityGateEvaluation,
+    ParityRunArtifact,
+    ParityScenarioMetrics,
+    build_default_cuda_decode_gate,
+    evaluate_parity_gate,
+)
 
 # Traffic - 流量控制
 from sagellm_benchmark.traffic import (
@@ -40,6 +59,21 @@ __all__ = [
     "ContractVersion",
     # Clients
     "BenchmarkClient",
+    "CoreDecodeStepTelemetryRecord",
+    "CoreDecodeTelemetryArtifact",
+    "CoreDecodeTelemetrySummary",
+    "build_core_decode_telemetry_artifact",
+    "extract_explicit_decode_snapshot",
+    "load_core_decode_telemetry_input",
+    "DecodeParityGate",
+    "DecodeParityScenario",
+    "DecodeParityThresholds",
+    "GateFailureCategory",
+    "ParityRunArtifact",
+    "ParityScenarioMetrics",
+    "ParityGateEvaluation",
+    "build_default_cuda_decode_gate",
+    "evaluate_parity_gate",
     # Traffic
     "ArrivalPattern",
     "TrafficProfile",

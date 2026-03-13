@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from dataclasses import dataclass
 from hashlib import sha256
 from statistics import mean
@@ -122,6 +123,7 @@ def run_e2e_model_benchmarks(
                             "ttft_ms": ttft,
                             "tbt_ms": tbt,
                             "throughput_tps": throughput,
+                            "output_throughput_tps": throughput * scenario.batch_size,
                             "latency_p50_ms": _percentile(latencies, 50),
                             "latency_p95_ms": _percentile(latencies, 95),
                             "latency_p99_ms": _percentile(latencies, 99),
@@ -405,7 +407,9 @@ async def _run_live_scenario(
         for i in range(scenario.batch_size)
     ]
 
+    started_at = time.perf_counter()
     results = await client.generate_batch(requests, concurrent=True)
+    wall_time_s = max(time.perf_counter() - started_at, 1e-9)
 
     # Aggregate per-request metrics
     ttft_values: list[float] = []
@@ -431,6 +435,8 @@ async def _run_live_scenario(
     avg_ttft = mean(ttft_values) if ttft_values else 0.0
     avg_tbt = mean(tbt_values) if tbt_values else 0.0
     avg_throughput = mean(throughput_values) if throughput_values else 0.0
+    total_output_tokens = sum(result.output_tokens for result in results if result.success)
+    output_throughput_tps = total_output_tokens / wall_time_s if successful else 0.0
 
     logger.info(
         f"Scenario {scenario.name}: {successful}/{len(results)} ok, "
@@ -446,6 +452,7 @@ async def _run_live_scenario(
         "ttft_ms": avg_ttft,
         "tbt_ms": avg_tbt,
         "throughput_tps": avg_throughput,
+        "output_throughput_tps": output_throughput_tps,
         "latency_p50_ms": _percentile(e2e_latencies, 50),
         "latency_p95_ms": _percentile(e2e_latencies, 95),
         "latency_p99_ms": _percentile(e2e_latencies, 99),
@@ -479,4 +486,9 @@ def summarize_e2e_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_ttft_ms": mean(row["ttft_ms"] for row in rows) if rows else 0.0,
         "avg_tbt_ms": mean(row["tbt_ms"] for row in rows) if rows else 0.0,
         "avg_throughput_tps": mean(row["throughput_tps"] for row in rows) if rows else 0.0,
+        "avg_output_throughput_tps": (
+            mean(row.get("output_throughput_tps", row["throughput_tps"]) for row in rows)
+            if rows
+            else 0.0
+        ),
     }

@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- 新增 `sagellm-benchmark validate-serving-consistency` 与 `runtime_consistency.py`：在真实 endpoint 上复用 live compare 采集链路执行最小 small-batch decode 复测，并对 `/info`、`performance_mainline.decode_runtime_diagnostics`、自动生成的 `core_telemetry` 以及 backend round3 benchmark artifact 做 fail-fast 一致性校验，直接暴露“内部 native、服务端 fallback”这类 split-brain 失配。
+- 新增 `parity_gate.py` 与 `sagellm-benchmark parity-gate ...` CLI，正式定义可复用的 decode parity gate schema：固定 `bs=1/2/4`、warmup/repeat、correctness、fallback-rate、step-evidence、TBT/throughput 判定带，并支持把现有 `compare-record` / `compare` 生成的 `e2e` 工件转换为 gate 输入，明确区分 `performance` / `correctness` / `fallback` / `capability` / `telemetry` 失败类别。
+- 新增 `core_telemetry.py` 与 `sagellm-benchmark parity-gate convert-core-telemetry`：可直接消费 `sagellm-core` 的 `LLMEngine.get_info()` / `performance_mainline.explicit_decode` 输出，按稳定字段校验并生成 `core-decode-step-telemetry/v1` 工件与按 `batch_size` / `selected_implementation` / `selected_operator_pack` 聚合的摘要，供 backend before/after 与 parity 分析复用。
+- `compare`、`compare-record` 与 `vllm-compare run` 现在会在 live compare 同步落盘 `<label>.parity.json`，直接产出 `parity-run/v1` artifact；缺少 `hardware_family`、吞吐字段或 correctness 字段时显式失败，不再依赖手工转换临时整理。
+- `compare` / `compare-record` 现在会 best-effort 抓取目标 endpoint 的 `/info` 并自动落盘 `<label>_info.json`；当 `/info` 中存在 `performance_mainline.explicit_decode` 时，还会自动生成 `<label>_core_telemetry.json`，使 live compare 工件可直接复用到 decode parity / backend before-after 分析，而不再需要手工二次转换当前运行结果。
+
 ### Fixed
+- parity gate 现在不会因为 `telemetry` 或 `fallback evidence` 缺失而短路后续性能判断；同一 scenario 会同时保留 `telemetry` / `fallback` / `performance` 等多条失败事实。legacy `e2e` 工件转换也不再把 `throughput_tps * batch_size` 误当作输出吞吐，且不再把缺失的 fallback 证据伪造成 `fallback_rate=0.0`。
 - `.gitignore` 现在默认忽略本地 `.env` / `.env.local` / `.env.*` 配置文件，同时保留 `.env.example` / `.env.template` 模板文件可提交，避免 live compare 与本地 endpoint 凭证被误提交。
 - `run_benchmark.sh` 的 `convergence` profile 现改为向 `sagellm-benchmark compare` 传递正确的 `--server-wait` 参数，避免 live compare 在启动前因错误选项名 `--server-wait-s` 直接失败，确保 `comparison.json/.md`、`validation_summary.json` 和 `VALIDATION.md` 能正常生成。
 - `run_benchmark.sh` 的 probe 采集现支持在 endpoint 不提供 `/info` 时自动回退抓取 `/v1/models`，并在 `validation_summary.json` / `VALIDATION.md` 中显式标出 `probe_coverage` 与 `evidence_gaps`，避免 `vLLM` 或轻量服务缺少 `/info` 时出现无解释的证据空洞。
@@ -19,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - README 与 QUICKSTART 现补充“指标字段 -> 主路径语义”映射，明确 `avg_tbt_ms`、`output_throughput_tps`、`shared_stream_markers.hits`、`paged_path_markers.hits`、`block_table_markers.hits` 应如何组合解读，避免只看 latency/throughput 就误判为主路径已收敛。
+- README 新增 CUDA decode parity gate 章节，明确“齐平”采用 best-reference 误差带判定，而不是口头目标。
 - README 与 QUICKSTART 现在提供面向国产硬件优化收敛的标准 benchmark/validation 闭环，明确推荐比较字段：`avg_ttft_ms`、`avg_tbt_ms`、`avg_throughput_tps`、`output_throughput_tps`、`request_throughput_rps`、`shared_stream_markers.hits`、`paged_path_markers.hits`、`block_table_markers.hits`，并给出 shared-stream before/after、paged/native on/off、跨后端硬件对比的可复现命令模板。
 - benchmark OpenAI client 现在会优先从 `SAGELLM_BENCHMARK_LOCAL_MODEL_DIR` / `VLLM_LOCAL_MODEL_DIR` / `HF_LOCAL_MODEL_DIR` 和 `~/.cache/hf-local-models/<model>` 解析 tokenizer；只有本地目录不存在时才回退到 HuggingFace repo id，并默认把 `HF_ENDPOINT` 补为 `https://hf-mirror.com`，减少 live compare 时对 `huggingface.co` 的意外探测与超时噪音。
 - OpenAI-compatible benchmark client (`GatewayClient`) 现在优先使用请求模型对应的 tokenizer 对完整输出文本做真实 token 计数，并据此计算 `output_tokens` / `prompt_tokens` / `tpot_ms` / `throughput_tps`；不再把 SSE stream chunk 数误当成 token 数。若本地/cached tokenizer 不可用，会显式回退到 chunk 计数并记录 warning。

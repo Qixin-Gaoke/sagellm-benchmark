@@ -36,6 +36,47 @@ Interpretation rule:
 - Marker evidence without competitive latency/throughput means the path is wired, but not yet performant.
 - A valid convergence claim should combine metric deltas with `/info`, `/metrics`, or `*_log_probe.json` evidence.
 
+## CUDA Decode Parity Gate
+
+Round 0 的统一 gate 不再用“至少齐平”这类模糊说法，而是固定成一个可执行 schema：
+
+- Workload: `short` (`128 -> 128`) + `long` (`2048 -> 512`)
+- Batch sizes: `1 / 2 / 4`
+- Warmup: `3`
+- Measured rounds: `10`
+- Pass rule: 每个 scenario 都必须同时满足
+   - `correctness_pass_rate == 1.0`
+   - `fallback_rate == 0.0`
+   - 存在 step-level evidence
+   - `candidate_tbt <= best_reference_tbt * 1.05`
+   - `candidate_output_throughput >= best_reference_output_throughput * 0.95`
+
+评估语义保持单一 gate，不再拆第二套 schema：
+
+- `telemetry`、`performance`、`correctness`、`fallback`、`capability` 会分别落盘，并且同一个 scenario 可以同时出现多条失败事实。
+- 缺少 step telemetry 不会再短路性能判断；如果旧工件同时 telemetry 缺失且性能退化，输出里会同时看到两类失败。
+- 旧 `compare-record` / `compare` 的 `e2e` 工件仍然可直接评估，但会被诚实地标记为“缺少 fallback evidence”，而不是把 `fallback_rate` 伪造成 `0.0`。
+- legacy `e2e` 工件的吞吐会优先读取 `output_throughput_tps`，否则退回现有 `throughput_tps` 作为兼容代理值；不会再额外乘 `batch_size`。
+
+默认 gate 定义可直接导出：
+
+```bash
+sagellm-benchmark parity-gate print-default \
+   --output ./benchmark_results/cuda_decode_parity_gate.json
+```
+
+用现有 `compare-record` / `compare` 工件做 gate 评估：
+
+```bash
+sagellm-benchmark parity-gate evaluate \
+   --candidate ./benchmark_results/sagellm.json \
+   --reference ./benchmark_results/vllm.json \
+   --reference ./benchmark_results/sglang.json \
+   --output ./benchmark_results/parity_evaluation.json
+```
+
+如果输入只是当前 `e2e` compare 工件而没有额外 step telemetry / fallback evidence，评估会明确报 `telemetry` 与 `fallback` 失败；若同时存在性能退化，也会一起报出，而不是被前面的证据缺口短路掉。
+
 ## Features
 
 - End-to-end Q1-Q8 query workloads covering diverse LLM scenarios
@@ -116,6 +157,10 @@ sagellm-benchmark compare-offline \
    --result sagellm=./benchmark_results/sequential/sagellm/sagellm.json \
    --result vllm=./benchmark_results/sequential/vllm/vllm.json \
    --output-dir ./benchmark_results/sequential/compare
+
+# compare / compare-record will also best-effort capture runtime metadata from
+# /info into <label>_info.json, and when the endpoint is sagellm-core with
+# explicit decode telemetry enabled, emit <label>_core_telemetry.json.
 
 # In an interactive terminal, compare can also prompt to kill local target
 # processes after the benchmark finishes.
@@ -198,7 +243,7 @@ sagellm-benchmark perf --type e2e --plot --plot-format png --plot-format pdf --t
 When validating the mainline architecture rather than just endpoint speed, preserve three artifact classes together:
 
 - compare results: `comparison.json/.md`
-- runtime surfaces: `*_info.json`, `*_metrics.prom`
+- runtime surfaces: `*_info.json`, `*_core_telemetry.json`, `*_metrics.prom`
 - path evidence: `*_log_probe.json`
 
 ## Convergence Validation Loop
@@ -223,6 +268,7 @@ Standard artifacts written by `./run_benchmark.sh --profile convergence`:
 - `REPRODUCE.sh`
 - `<label>.json` and `<label>.md`
 - `<label>_info.json`
+- `<label>_core_telemetry.json` when `/info` exposes `performance_mainline.explicit_decode`
 - `<label>_metrics.prom`
 - `<label>_log_probe.json` when `--log-file LABEL=PATH` is provided
 
@@ -231,6 +277,19 @@ Recommended benchmark interpretation:
 - Shared-stream batching: compare `avg_ttft_ms`, `avg_tbt_ms`, and `output_throughput_tps` at `--batch-size 2` and `--batch-size 4`, then confirm the candidate endpoint shows non-zero `shared_stream_markers.hits`.
 - Paged/native path usage: inspect `<label>_metrics.prom`, `<label>_info.json`, and `<label>_log_probe.json` for non-zero `paged_path_markers.hits`.
 - Formal block-table path: inspect `<label>_log_probe.json` for non-zero `block_table_markers.hits`, then correlate with the batch-size latency/throughput deltas.
+
+`compare` / `compare-record` now generate `<label>_core_telemetry.json` automatically when the target `/info` payload carries `performance_mainline.explicit_decode`. If you need to backfill older captures or convert a standalone `LLMEngine.get_info()` dump, normalize it with:
+
+```bash
+sagellm-benchmark parity-gate convert-core-telemetry \
+   --input-json ./sagellm_info.json \
+   --label sagellm_after \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --hardware-family cuda \
+   --output ./benchmark_results/sagellm_after_core_telemetry.json
+```
+
+The output artifact preserves the stable step rows from `performance_mainline.explicit_decode.step_telemetry` and adds a compact summary grouped by `batch_size`, `selected_implementation`, and `selected_operator_pack`, so backend before/after analysis no longer depends on hand-parsed profiler traces.
 
 Reproducible command templates:
 

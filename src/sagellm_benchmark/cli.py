@@ -15,17 +15,31 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import click
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
+from sagellm_benchmark.core_telemetry import build_core_decode_telemetry_artifact
 from sagellm_benchmark.nonstream_compare import (
     NonStreamCompareConfig,
     parse_target_spec,
     run_nonstream_compare,
+)
+from sagellm_benchmark.parity_gate import (
+    DecodeParityGate,
+    build_default_cuda_decode_gate,
+    build_parity_run_artifact_from_e2e_payload,
+    evaluate_parity_gate,
+    load_parity_run_artifact,
+)
+from sagellm_benchmark.runtime_consistency import (
+    build_live_runtime_consistency_report,
+    extract_runtime_info_payload,
 )
 
 console = Console()
@@ -165,6 +179,7 @@ def _run_compare_target(
     label: str,
     url: str,
     model: str,
+    hardware_family: str,
     batch_sizes: tuple[int, ...],
     api_key: str,
     request_timeout: float,
@@ -192,27 +207,44 @@ def _run_compare_target(
         max_output_tokens=max_output_tokens,
     )
     summary = summarize_e2e_rows(rows)
+    runtime_artifacts = _capture_target_runtime_artifacts(
+        label=label,
+        url=url,
+        model=model,
+        hardware_family=hardware_family,
+        api_key=api_key,
+        request_timeout=request_timeout,
+        output_dir=output_dir,
+    )
     payload = {
         "kind": "e2e",
         "simulate": False,
         "mode": "live-compare",
         "label": label,
         "url": url,
+        "hardware_family": hardware_family,
         "models": [model],
         "batch_sizes": list(batch_sizes),
         "precisions": ["live"],
+        "runtime_artifacts": runtime_artifacts,
         "summary": summary,
         "rows": rows,
     }
+    parity_artifact = build_parity_run_artifact_from_e2e_payload(
+        payload,
+        hardware_family=hardware_family,
+    )
 
     file_stem = _slugify_filename(label)
     json_path = output_dir / f"{file_stem}.json"
     md_path = output_dir / f"{file_stem}.md"
+    parity_path = output_dir / f"{file_stem}.parity.json"
 
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
     with open(md_path, "w") as f:
         f.write(_format_e2e_markdown(payload) + "\n")
+    parity_path.write_text(parity_artifact.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
     return {
         "label": label,
@@ -220,6 +252,8 @@ def _run_compare_target(
         "summary": summary,
         "json": str(json_path),
         "markdown": str(md_path),
+        "parity_json": str(parity_path),
+        "runtime_artifacts": runtime_artifacts,
         "payload": payload,
     }
 
@@ -289,6 +323,85 @@ def _is_local_target_url(url: str) -> bool:
     """Return whether a compare target points at a local endpoint."""
     parsed = urlparse(url)
     return parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+
+
+def _root_url_from_api_base(url: str) -> str:
+    """Return the endpoint root URL for auxiliary probes like /info."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return parsed._replace(path=path or "/", params="", query="", fragment="").geturl().rstrip("/")
+
+
+def _fetch_json_probe(
+    url: str,
+    *,
+    api_key: str,
+    timeout_s: float,
+) -> dict[str, object] | None:
+    """Fetch a JSON probe endpoint and return the decoded payload when available."""
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if "json" not in content_type.lower():
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _capture_target_runtime_artifacts(
+    *,
+    label: str,
+    url: str,
+    model: str,
+    hardware_family: str,
+    api_key: str,
+    request_timeout: float,
+    output_dir: Path,
+) -> dict[str, str]:
+    """Best-effort capture of runtime metadata artifacts for compare targets."""
+    info_payload = _fetch_json_probe(
+        f"{_root_url_from_api_base(url)}/info",
+        api_key=api_key,
+        timeout_s=min(request_timeout, 5.0),
+    )
+    if info_payload is None:
+        return {}
+
+    file_stem = _slugify_filename(label)
+    runtime_artifacts: dict[str, str] = {}
+
+    info_path = output_dir / f"{file_stem}_info.json"
+    info_path.write_text(json.dumps(info_payload, indent=2) + "\n", encoding="utf-8")
+    runtime_artifacts["info_json"] = str(info_path)
+
+    try:
+        telemetry_source_payload = extract_runtime_info_payload(info_payload)
+    except ValueError:
+        return runtime_artifacts
+
+    performance_mainline = telemetry_source_payload.get("performance_mainline")
+    if not isinstance(performance_mainline, dict) or "explicit_decode" not in performance_mainline:
+        return runtime_artifacts
+
+    artifact = build_core_decode_telemetry_artifact(
+        telemetry_source_payload,
+        label=label,
+        model=model,
+        hardware_family=hardware_family,
+    )
+    telemetry_path = output_dir / f"{file_stem}_core_telemetry.json"
+    telemetry_path.write_text(artifact.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    runtime_artifacts["core_telemetry_json"] = str(telemetry_path)
+    return runtime_artifacts
 
 
 def _discover_local_target_processes(
@@ -649,6 +762,7 @@ def _run_compare_command(
     *,
     targets: tuple[str, ...],
     model: str,
+    hardware_family: str,
     batch_sizes: tuple[int, ...],
     api_key: str,
     request_timeout: float,
@@ -688,6 +802,7 @@ def _run_compare_command(
             label=label,
             url=url,
             model=model,
+            hardware_family=hardware_family,
             batch_sizes=batch_sizes,
             api_key=api_key,
             request_timeout=request_timeout,
@@ -716,6 +831,8 @@ def _run_compare_command(
     console.print("\n[bold green]✓ Compare completed[/bold green]")
     console.print(f"Comparison JSON: {comparison_json}")
     console.print(f"Comparison Markdown: {comparison_md}")
+    for target_result in target_results:
+        console.print(f"Parity Artifact ({target_result['label']}): {target_result['parity_json']}")
     _maybe_prompt_cleanup_local_targets(
         parsed_targets,
         prompt_cleanup=prompt_cleanup,
@@ -952,9 +1069,153 @@ def main() -> None:
     pass
 
 
+@main.group("parity-gate")
+def parity_gate_group() -> None:
+    """Inspect or evaluate parity gates."""
+
+
+@parity_gate_group.command("print-default")
+@click.option(
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Optional path to write the default parity gate JSON.",
+)
+def parity_gate_print_default(output: str | None) -> None:
+    """Print the default CUDA decode parity gate definition."""
+    gate = build_default_cuda_decode_gate()
+    payload = gate.model_dump_json(indent=2)
+    if output is None:
+        click.echo(payload)
+        return
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(payload + "\n")
+    console.print(f"[green]✓[/green] Wrote default parity gate: {output_path}")
+
+
+@parity_gate_group.command("evaluate")
+@click.option(
+    "--candidate",
+    required=True,
+    type=click.Path(exists=True),
+    help="Candidate parity artifact or compare-record e2e payload.",
+)
+@click.option(
+    "--reference",
+    "references",
+    multiple=True,
+    required=True,
+    type=click.Path(exists=True),
+    help="Reference parity artifact or compare-record e2e payload. Repeat for multiple engines.",
+)
+@click.option(
+    "--gate-json",
+    type=click.Path(exists=True),
+    default=None,
+    help="Optional custom parity gate JSON. Defaults to the built-in CUDA decode gate.",
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Optional path to write the evaluation JSON.",
+)
+def parity_gate_evaluate(
+    candidate: str,
+    references: tuple[str, ...],
+    gate_json: str | None,
+    output: str | None,
+) -> None:
+    """Evaluate a candidate artifact against the parity gate."""
+    gate = (
+        DecodeParityGate.model_validate_json(Path(gate_json).read_text())
+        if gate_json is not None
+        else build_default_cuda_decode_gate()
+    )
+    candidate_artifact = load_parity_run_artifact(candidate)
+    reference_artifacts = [load_parity_run_artifact(path) for path in references]
+    evaluation = evaluate_parity_gate(gate, candidate_artifact, reference_artifacts)
+
+    console.print("[bold cyan]Parity Gate Evaluation[/bold cyan]")
+    console.print(f"Gate: {evaluation.gate_id}")
+    console.print(f"Candidate: {evaluation.candidate_label}")
+    console.print(f"Passed: {'yes' if evaluation.passed else 'no'}")
+    scenario_groups: dict[str, list[object]] = {}
+    for result in evaluation.results:
+        scenario_groups.setdefault(result.scenario_name, []).append(result)
+    for scenario_name, scenario_results in scenario_groups.items():
+        console.print(f"- {scenario_name}")
+        for result in scenario_results:
+            console.print(f"  * {result.category.value}: {result.message}")
+
+    payload = evaluation.model_dump_json(indent=2)
+    if output is not None:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload + "\n")
+        console.print(f"[green]✓[/green] Wrote parity evaluation: {output_path}")
+
+
+@parity_gate_group.command("convert-core-telemetry")
+@click.option(
+    "--input-json",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to a full LLMEngine.get_info() dump or performance_mainline.explicit_decode JSON.",
+)
+@click.option(
+    "--label",
+    required=True,
+    help="Stable benchmark label for the captured endpoint, e.g. sagellm_before.",
+)
+@click.option(
+    "--model",
+    required=True,
+    help="Model name associated with this telemetry capture.",
+)
+@click.option(
+    "--hardware-family",
+    required=True,
+    help="Hardware family for this capture, e.g. cuda or ascend.",
+)
+@click.option(
+    "--output",
+    type=click.Path(),
+    required=True,
+    help="Path to write the normalized benchmark telemetry artifact.",
+)
+def parity_gate_convert_core_telemetry(
+    input_json: str,
+    label: str,
+    model: str,
+    hardware_family: str,
+    output: str,
+) -> None:
+    """Convert sagellm-core explicit decode telemetry into a stable benchmark artifact."""
+    input_path = Path(input_json)
+    artifact = build_core_decode_telemetry_artifact(
+        json.loads(input_path.read_text()),
+        label=label,
+        model=model,
+        hardware_family=hardware_family,
+    )
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(artifact.model_dump_json(indent=2) + "\n")
+    console.print(f"[green]✓[/green] Wrote core decode telemetry artifact: {output_path}")
+
+
 @main.command("compare-record")
 @click.option("--label", required=True, help="Label for this target capture, e.g. sagellm.")
 @click.option("--url", required=True, help="OpenAI-compatible endpoint URL to benchmark.")
+@click.option(
+    "--hardware-family",
+    required=True,
+    help="Hardware family used by this live compare run, e.g. cuda or ascend.",
+)
 @click.option(
     "--model",
     type=str,
@@ -1015,6 +1276,7 @@ def main() -> None:
 def compare_record(
     label: str,
     url: str,
+    hardware_family: str,
     model: str,
     batch_sizes: tuple[int, ...],
     api_key: str,
@@ -1038,6 +1300,7 @@ def compare_record(
         label=label,
         url=url,
         model=model,
+        hardware_family=hardware_family,
         batch_sizes=batch_sizes,
         api_key=api_key,
         request_timeout=request_timeout,
@@ -1054,6 +1317,185 @@ def compare_record(
     )
     console.print(f"JSON: {target_result['json']}")
     console.print(f"Markdown: {target_result['markdown']}")
+    console.print(f"Parity Artifact: {target_result['parity_json']}")
+
+
+@main.command("validate-serving-consistency")
+@click.option("--label", required=True, help="Label for this target capture, e.g. sagellm.")
+@click.option("--url", required=True, help="OpenAI-compatible endpoint URL to validate.")
+@click.option(
+    "--hardware-family",
+    required=True,
+    help="Hardware family used by this live validation run, e.g. cuda or ascend.",
+)
+@click.option(
+    "--model",
+    type=str,
+    default="Qwen/Qwen2.5-0.5B-Instruct",
+    show_default=True,
+    help="Requested model name for the validation run.",
+)
+@click.option(
+    "--reference-artifact",
+    required=True,
+    type=click.Path(exists=True),
+    help="Backend benchmark artifact used as the expected runtime conclusion.",
+)
+@click.option(
+    "--batch-size",
+    "batch_sizes",
+    multiple=True,
+    type=int,
+    default=(1,),
+    show_default=True,
+    help="Small-batch decode sizes to validate. Repeat for multiple values.",
+)
+@click.option(
+    "--api-key",
+    type=str,
+    default="sagellm-benchmark",
+    show_default=True,
+    help="API key used for the endpoint.",
+)
+@click.option(
+    "--request-timeout",
+    type=float,
+    default=120.0,
+    show_default=True,
+    help="Per-request timeout in seconds.",
+)
+@click.option(
+    "--server-wait",
+    "server_wait_s",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Max seconds to wait for the endpoint to become ready.",
+)
+@click.option(
+    "--max-seq-len",
+    type=int,
+    default=None,
+    help="Override the detected maximum sequence length.",
+)
+@click.option(
+    "--max-output-tokens",
+    type=int,
+    default=64,
+    show_default=True,
+    help="Hard cap on output tokens for each request.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help=(
+        "Directory to save validation artifacts "
+        "(default: benchmark_results/validate-serving-consistency_<timestamp>)."
+    ),
+)
+def validate_serving_consistency(
+    label: str,
+    url: str,
+    hardware_family: str,
+    model: str,
+    reference_artifact: str,
+    batch_sizes: tuple[int, ...],
+    api_key: str,
+    request_timeout: float,
+    server_wait_s: float,
+    max_seq_len: int | None,
+    max_output_tokens: int,
+    output_dir: str | None,
+) -> None:
+    """Run a minimal live decode retest and fail fast on runtime evidence mismatches."""
+    validation_output_dir = _create_compare_output_dir(
+        output_dir,
+        prefix="validate-serving-consistency",
+    )
+    validation_output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print("[bold cyan]sageLLM Serving Consistency Validation[/bold cyan]")
+    console.print(f"Label: {label}")
+    console.print(f"URL: {url}")
+    console.print(f"Model: {model}")
+    console.print(f"Reference Artifact: {reference_artifact}")
+    console.print(f"Output: {validation_output_dir}\n")
+
+    target_result = _run_compare_target(
+        label=label,
+        url=url,
+        model=model,
+        hardware_family=hardware_family,
+        batch_sizes=batch_sizes,
+        api_key=api_key,
+        request_timeout=request_timeout,
+        server_wait_s=server_wait_s,
+        max_seq_len=max_seq_len,
+        max_output_tokens=max_output_tokens,
+        output_dir=validation_output_dir,
+    )
+    try:
+        report = build_live_runtime_consistency_report(
+            label=label,
+            url=url,
+            model=model,
+            hardware_family=hardware_family,
+            requested_batch_sizes=list(batch_sizes),
+            target_payload=target_result["payload"],
+            runtime_artifacts=target_result["runtime_artifacts"],
+            reference_artifact_path=reference_artifact,
+        )
+    except ValueError as exc:
+        report = {
+            "schema_version": "live-runtime-consistency/v1",
+            "passed": False,
+            "label": label,
+            "url": url,
+            "model": model,
+            "hardware_family": hardware_family,
+            "validation_batch_sizes": list(batch_sizes),
+            "successful_live_batch_sizes": sorted(
+                {
+                    int(row.get("batch_size", 0))
+                    for row in target_result["payload"].get("rows", [])
+                    if isinstance(row, dict) and int(row.get("successful_requests", 0) or 0) > 0
+                }
+            ),
+            "observed_batch_size": None,
+            "reference_artifact": str(reference_artifact),
+            "runtime_artifacts": dict(target_result["runtime_artifacts"]),
+            "observed": {},
+            "reference": {},
+            "findings": [
+                {
+                    "code": "precondition-failure",
+                    "message": str(exc),
+                }
+            ],
+        }
+
+    report_path = validation_output_dir / f"{_slugify_filename(label)}_runtime_consistency.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    observed = report["observed"]
+    console.print(
+        "Observed: "
+        f"attention={observed.get('attention_selected_implementation')}, "
+        f"adjacent={observed.get('adjacent_selected_implementation')}, "
+        f"batch={report['observed_batch_size']}"
+    )
+    console.print(f"Validation Report: {report_path}")
+
+    if not report["passed"]:
+        finding_lines = "\n".join(
+            f"- {finding['code']}: {finding['message']}" for finding in report["findings"]
+        )
+        raise click.ClickException("Live serving consistency validation failed:\n" + finding_lines)
+
+    console.print(
+        "[bold green]✓ Runtime evidence is consistent across /info, telemetry, and artifact[/bold green]"
+    )
 
 
 @main.command("compare-offline")
@@ -1661,6 +2103,11 @@ def perf(
     help="Requested model name for the benchmark run.",
 )
 @click.option(
+    "--hardware-family",
+    required=True,
+    help="Hardware family shared by the compared endpoints, e.g. cuda or ascend.",
+)
+@click.option(
     "--batch-size",
     "batch_sizes",
     multiple=True,
@@ -1720,6 +2167,7 @@ def compare(
     targets: tuple[str, ...],
     target_commands: tuple[str, ...],
     model: str,
+    hardware_family: str,
     batch_sizes: tuple[int, ...],
     api_key: str,
     request_timeout: float,
@@ -1734,6 +2182,7 @@ def compare(
         targets=targets,
         target_commands=dict(_parse_label_command(spec) for spec in target_commands),
         model=model,
+        hardware_family=hardware_family,
         batch_sizes=batch_sizes,
         api_key=api_key,
         request_timeout=request_timeout,
@@ -1837,6 +2286,11 @@ def vllm_compare_install_ascend(python_bin: str, sagellm_root: str) -> None:
     help="Requested model name for the benchmark run.",
 )
 @click.option(
+    "--hardware-family",
+    required=True,
+    help="Hardware family shared by sageLLM and vLLM for this compare run, e.g. cuda or ascend.",
+)
+@click.option(
     "--batch-size",
     "batch_sizes",
     multiple=True,
@@ -1897,6 +2351,7 @@ def vllm_compare_run(
     sagellm_url: str,
     start_sagellm_cmd: str | None,
     model: str,
+    hardware_family: str,
     batch_sizes: tuple[int, ...],
     api_key: str,
     request_timeout: float,
@@ -1918,6 +2373,7 @@ def vllm_compare_run(
             if value
         },
         model=model,
+        hardware_family=hardware_family,
         batch_sizes=batch_sizes,
         api_key=api_key,
         request_timeout=request_timeout,
