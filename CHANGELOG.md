@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `compare` live path 现在会对 `sagellm=*` 目标做显式 decode 运行时门禁：若 `/info.performance_mainline.explicit_decode.feature_gate` 缺失、`default_enabled=false`、`enabled=false` 或 `kill_switch_active=true`，benchmark 将直接 fail-fast，避免再拿未命中 native explicit decode 的 endpoint 与 vLLM 做无效对比。
 - 新增 `sagellm-benchmark validate-serving-consistency` 与 `runtime_consistency.py`：在真实 endpoint 上复用 live compare 采集链路执行最小 small-batch decode 复测，并对 `/info`、`performance_mainline.decode_runtime_diagnostics`、自动生成的 `core_telemetry` 以及 backend round3 benchmark artifact 做 fail-fast 一致性校验，直接暴露“内部 native、服务端 fallback”这类 split-brain 失配。
 - 新增 `parity_gate.py` 与 `sagellm-benchmark parity-gate ...` CLI，正式定义可复用的 decode parity gate schema：固定 `bs=1/2/4`、warmup/repeat、correctness、fallback-rate、step-evidence、TBT/throughput 判定带，并支持把现有 `compare-record` / `compare` 生成的 `e2e` 工件转换为 gate 输入，明确区分 `performance` / `correctness` / `fallback` / `capability` / `telemetry` 失败类别。
 - 新增 `core_telemetry.py` 与 `sagellm-benchmark parity-gate convert-core-telemetry`：可直接消费 `sagellm-core` 的 `LLMEngine.get_info()` / `performance_mainline.explicit_decode` 输出，按稳定字段校验并生成 `core-decode-step-telemetry/v1` 工件与按 `batch_size` / `selected_implementation` / `selected_operator_pack` 聚合的摘要，供 backend before/after 与 parity 分析复用。

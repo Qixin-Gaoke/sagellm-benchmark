@@ -216,6 +216,10 @@ def _run_compare_target(
         request_timeout=request_timeout,
         output_dir=output_dir,
     )
+    _validate_sagellm_explicit_decode_runtime(
+        label=label,
+        runtime_artifacts=runtime_artifacts,
+    )
     payload = {
         "kind": "e2e",
         "simulate": False,
@@ -402,6 +406,55 @@ def _capture_target_runtime_artifacts(
     telemetry_path.write_text(artifact.model_dump_json(indent=2) + "\n", encoding="utf-8")
     runtime_artifacts["core_telemetry_json"] = str(telemetry_path)
     return runtime_artifacts
+
+
+def _validate_sagellm_explicit_decode_runtime(
+    *,
+    label: str,
+    runtime_artifacts: dict[str, str],
+) -> None:
+    """Fail fast when a sagellm compare target is not running native explicit decode."""
+    if not label.lower().startswith("sagellm"):
+        return
+
+    info_json_path = runtime_artifacts.get("info_json")
+    if not info_json_path:
+        raise click.ClickException(
+            f"Target '{label}' did not expose /info runtime metadata; cannot verify native explicit decode."
+        )
+
+    info_payload = json.loads(Path(info_json_path).read_text(encoding="utf-8"))
+    runtime_info = extract_runtime_info_payload(info_payload)
+    performance_mainline = runtime_info.get("performance_mainline")
+    if not isinstance(performance_mainline, dict):
+        raise click.ClickException(
+            f"Target '{label}' /info payload is missing performance_mainline; refusing to benchmark an unverified runtime path."
+        )
+
+    explicit_decode = performance_mainline.get("explicit_decode")
+    if not isinstance(explicit_decode, dict):
+        raise click.ClickException(
+            f"Target '{label}' /info payload is missing performance_mainline.explicit_decode; refusing to benchmark an unverified runtime path."
+        )
+
+    feature_gate = explicit_decode.get("feature_gate")
+    if not isinstance(feature_gate, dict):
+        raise click.ClickException(
+            f"Target '{label}' /info payload is missing explicit decode feature gate state; refusing to benchmark an unverified runtime path."
+        )
+
+    if not bool(feature_gate.get("default_enabled", False)):
+        raise click.ClickException(
+            f"Target '{label}' reports explicit decode default_enabled=false; fix the serving defaults before benchmarking."
+        )
+    if not bool(feature_gate.get("enabled", False)):
+        raise click.ClickException(
+            f"Target '{label}' reports explicit decode enabled=false; use the native explicit decode path before benchmarking."
+        )
+    if bool(feature_gate.get("kill_switch_active", False)):
+        raise click.ClickException(
+            f"Target '{label}' reports explicit decode kill_switch_active=true; benchmark aborted."
+        )
 
 
 def _discover_local_target_processes(
