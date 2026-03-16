@@ -9,6 +9,14 @@
 | 导入命名空间 | `sagellm_benchmark` |
 | 主要职责 | 性能基准测试套件（独立的 benchmark suite） |
 
+## 🚫 Python 环境约束（强制）
+
+- 永远不要创建 `.venv` 或 `venv`，也不要建议用户创建。
+- 永远不要执行 `python -m venv`、`uv venv`、`virtualenv`、`source .venv/bin/activate` 等命令。
+- 所有测试、lint、脚本执行必须复用当前已配置的 conda 环境。
+- 如需运行 Python 命令，优先使用当前已激活的 conda 环境或显式使用 `conda run -n sagellm ...`。
+- 如果脚本默认要求创建 virtualenv，必须跳过该步骤并继续使用现有 conda 环境。
+
 ## 🚨 核心开发原则
 
 ### Protocol-First（协议优先）
