@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
+
+from sagellm_benchmark.compare_runner import run_nonstream_batch, summarize_nonstream_batch
 
 
 def _slugify_filename(value: str) -> str:
@@ -213,12 +215,15 @@ def _run_batch(
     request_fn: callable,
 ) -> dict[str, object]:
     """Run one concurrent batch against a single endpoint."""
-    started_at = perf_counter()
-    with ThreadPoolExecutor(max_workers=batch_size) as executor:
-        futures = [executor.submit(request_fn, target, request_config) for _ in range(batch_size)]
-        request_results = [future.result() for future in futures]
-    wall_time_ms = (perf_counter() - started_at) * 1000.0
-    return _summarize_batch(
+    request_results, wall_time_ms = asyncio.run(
+        run_nonstream_batch(
+            target=target,
+            request_factory=lambda _index: request_config,
+            batch_size=batch_size,
+            request_fn=request_fn,
+        )
+    )
+    return summarize_nonstream_batch(
         batch_size=batch_size,
         round_index=round_index,
         request_results=request_results,

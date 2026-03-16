@@ -29,11 +29,46 @@ WORKLOAD_SPECS = {
     for workload in [*TPCH_WORKLOADS, *M1_WORKLOADS]
 }
 
-LEADERBOARD_MANIFEST_SCHEMA_VERSION = "leaderboard-export-manifest/v1"
+LEADERBOARD_ENTRY_SCHEMA_VERSION = "leaderboard-export-entry/v2"
+LEADERBOARD_MANIFEST_SCHEMA_VERSION = "leaderboard-export-manifest/v2"
+LEADERBOARD_COMPARE_SNAPSHOT_SCHEMA_VERSION = "leaderboard-compare-snapshot/v1"
+SUPPORTED_CANONICAL_EXPORT_SCHEMA_VERSION = "canonical-benchmark-result/v2"
 
 
 class LeaderboardExporter:
     """Export benchmark results to leaderboard format."""
+
+    _REQUIRED_METRIC_FIELDS = (
+        "throughput_tps",
+        "peak_mem_mb",
+        "error_rate",
+        "prefix_hit_rate",
+        "kv_used_tokens",
+        "kv_used_bytes",
+        "evict_count",
+        "evict_ms",
+    )
+
+    _OPTIONAL_METRIC_FIELDS = (
+        "ttft_ms",
+        "tbt_ms",
+        "tpot_ms",
+        "itl_ms",
+        "p50_itl_ms",
+        "p95_itl_ms",
+        "p99_itl_ms",
+        "e2el_ms",
+        "p50_e2el_ms",
+        "p95_e2el_ms",
+        "p99_e2el_ms",
+        "request_throughput_rps",
+        "input_throughput_tps",
+        "output_throughput_tps",
+        "total_throughput_tps",
+        "total_input_tokens",
+        "total_output_tokens",
+        "spec_accept_rate",
+    )
 
     @staticmethod
     def _require_mapping(value: Any, *, field_name: str) -> dict[str, Any]:
@@ -58,6 +93,24 @@ class LeaderboardExporter:
             raise ValueError(f"{field_name} must be numeric") from exc
 
     @staticmethod
+    def _validate_optional_number(value: Any, *, field_name: str) -> float | None:
+        if value is None:
+            return None
+        return LeaderboardExporter._require_number(value, field_name=field_name)
+
+    @staticmethod
+    def _coerce_optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        return int(value)
+
+    @staticmethod
     def _entry_bucket(entry: dict[str, Any]) -> str:
         cluster = entry.get("cluster") or {}
         node_count = int(cluster.get("node_count") or 1)
@@ -68,6 +121,12 @@ class LeaderboardExporter:
         entry: dict[str, Any], *, label: str = "leaderboard entry"
     ) -> dict[str, Any]:
         payload = LeaderboardExporter._require_mapping(entry, field_name=label)
+
+        schema_version = LeaderboardExporter._require_text(
+            payload.get("schema_version"), field_name=f"{label}.schema_version"
+        )
+        if schema_version != LEADERBOARD_ENTRY_SCHEMA_VERSION:
+            raise ValueError(f"{label}.schema_version must be {LEADERBOARD_ENTRY_SCHEMA_VERSION!r}")
 
         LeaderboardExporter._require_text(payload.get("entry_id"), field_name=f"{label}.entry_id")
         LeaderboardExporter._require_text(payload.get("engine"), field_name=f"{label}.engine")
@@ -119,20 +178,12 @@ class LeaderboardExporter:
         metrics = LeaderboardExporter._require_mapping(
             payload.get("metrics"), field_name=f"{label}.metrics"
         )
-        for field in (
-            "ttft_ms",
-            "tbt_ms",
-            "tpot_ms",
-            "throughput_tps",
-            "peak_mem_mb",
-            "error_rate",
-            "prefix_hit_rate",
-            "kv_used_tokens",
-            "kv_used_bytes",
-            "evict_count",
-            "evict_ms",
-        ):
+        for field in LeaderboardExporter._REQUIRED_METRIC_FIELDS:
             LeaderboardExporter._require_number(
+                metrics.get(field), field_name=f"{label}.metrics.{field}"
+            )
+        for field in LeaderboardExporter._OPTIONAL_METRIC_FIELDS:
+            LeaderboardExporter._validate_optional_number(
                 metrics.get(field), field_name=f"{label}.metrics.{field}"
             )
 
@@ -398,6 +449,234 @@ class LeaderboardExporter:
         return "LEGACY"
 
     @staticmethod
+    def _build_compare_scope_key(entry: dict[str, Any]) -> str:
+        workload_name = LeaderboardExporter._extract_workload_name_from_entry(entry)
+        hardware = str(entry.get("hardware", {}).get("chip_model") or "unknown-hardware")
+        model = str(entry.get("model", {}).get("name") or "unknown-model")
+        precision = str(entry.get("model", {}).get("precision") or "unknown-precision")
+        config_type = str(entry.get("config_type") or "unknown-config")
+        chip_count = int(entry.get("hardware", {}).get("chip_count") or 0)
+        node_count = int((entry.get("cluster") or {}).get("node_count") or 1)
+        return "|".join(
+            [
+                model,
+                hardware,
+                precision,
+                workload_name,
+                config_type,
+                str(chip_count),
+                str(node_count),
+            ]
+        )
+
+    @staticmethod
+    def _engine_sort_key(entry: dict[str, Any]) -> tuple[int, str, str]:
+        engine = str(entry.get("engine") or "unknown")
+        priority = {
+            "sagellm": 0,
+            "vllm": 1,
+            "vllm-ascend": 2,
+            "sglang": 3,
+            "lmdeploy": 4,
+        }.get(engine, 10)
+        version = str(entry.get("engine_version") or "")
+        return (priority, engine, version)
+
+    @staticmethod
+    def _build_compare_engine_summary(entry: dict[str, Any]) -> dict[str, Any]:
+        metrics = entry.get("metrics") or {}
+        metadata = entry.get("metadata") or {}
+        return {
+            "engine": str(entry.get("engine") or "unknown"),
+            "engine_version": str(entry.get("engine_version") or "unknown"),
+            "entry_id": str(entry.get("entry_id") or ""),
+            "submitted_at": metadata.get("submitted_at"),
+            "canonical_path": entry.get("canonical_path"),
+            "metrics": {
+                "ttft_ms": float(metrics.get("ttft_ms") or 0.0),
+                "tbt_ms": float(metrics.get("tbt_ms") or 0.0),
+                "throughput_tps": float(metrics.get("throughput_tps") or 0.0),
+                "output_throughput_tps": float(
+                    metrics.get("output_throughput_tps") or metrics.get("throughput_tps") or 0.0
+                ),
+                "error_rate": float(metrics.get("error_rate") or 0.0),
+            },
+        }
+
+    @staticmethod
+    def _compute_relative_delta(
+        left_value: float | int | None,
+        right_value: float | int | None,
+    ) -> float | None:
+        if left_value is None or right_value in (None, 0):
+            return None
+        return round(
+            ((float(left_value) - float(right_value)) / abs(float(right_value))) * 100.0, 4
+        )
+
+    @staticmethod
+    def _metric_winner(
+        left_value: float | int | None,
+        right_value: float | int | None,
+        *,
+        higher_is_better: bool,
+    ) -> str:
+        if left_value is None or right_value is None:
+            return "unknown"
+        if float(left_value) == float(right_value):
+            return "parity"
+        if higher_is_better:
+            return "left" if float(left_value) > float(right_value) else "right"
+        return "left" if float(left_value) < float(right_value) else "right"
+
+    @staticmethod
+    def _select_preferred_pair(
+        entries: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        by_engine = {str(entry.get("engine") or "unknown"): entry for entry in entries}
+        preferred_orders = [
+            ("sagellm", "vllm"),
+            ("sagellm", "vllm-ascend"),
+            ("sagellm", "sglang"),
+            ("sagellm", "lmdeploy"),
+        ]
+        for left_engine, right_engine in preferred_orders:
+            if left_engine in by_engine and right_engine in by_engine:
+                return by_engine[left_engine], by_engine[right_engine]
+
+        if len(entries) >= 2:
+            ordered = sorted(entries, key=LeaderboardExporter._engine_sort_key)
+            return ordered[0], ordered[1]
+        return None
+
+    @staticmethod
+    def build_compare_snapshot(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        deduped_entries: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            normalized = LeaderboardExporter.annotate_entry_identity(entry)
+            key = normalized["metadata"]["idempotency_key"]
+            existing = deduped_entries.get(key)
+            deduped_entries[key] = (
+                LeaderboardExporter.prefer_newer_entry(existing, normalized)
+                if existing is not None
+                else normalized
+            )
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for entry in deduped_entries.values():
+            scope_key = LeaderboardExporter._build_compare_scope_key(entry)
+            group = grouped.setdefault(
+                scope_key,
+                {
+                    "scope_key": scope_key,
+                    "scope": {
+                        "model": str(entry.get("model", {}).get("name") or "unknown-model"),
+                        "hardware": str(
+                            entry.get("hardware", {}).get("chip_model") or "unknown-hardware"
+                        ),
+                        "precision": str(
+                            entry.get("model", {}).get("precision") or "unknown-precision"
+                        ),
+                        "workload": LeaderboardExporter._extract_workload_name_from_entry(entry),
+                        "config_type": str(entry.get("config_type") or "unknown-config"),
+                        "chip_count": int(entry.get("hardware", {}).get("chip_count") or 0),
+                        "node_count": int((entry.get("cluster") or {}).get("node_count") or 1),
+                    },
+                    "category": LeaderboardExporter._entry_bucket(entry),
+                    "entries_by_engine": {},
+                },
+            )
+
+            engine = str(entry.get("engine") or "unknown")
+            existing = group["entries_by_engine"].get(engine)
+            group["entries_by_engine"][engine] = (
+                LeaderboardExporter.prefer_newer_entry(existing, entry)
+                if existing is not None
+                else entry
+            )
+
+        groups_payload: list[dict[str, Any]] = []
+        preferred_pairs: list[dict[str, Any]] = []
+        for group in grouped.values():
+            representative_entries = sorted(
+                group["entries_by_engine"].values(), key=LeaderboardExporter._engine_sort_key
+            )
+            if len(representative_entries) < 2:
+                continue
+
+            preferred_pair = LeaderboardExporter._select_preferred_pair(representative_entries)
+            if preferred_pair is None:
+                continue
+
+            left_entry, right_entry = preferred_pair
+            left_summary = LeaderboardExporter._build_compare_engine_summary(left_entry)
+            right_summary = LeaderboardExporter._build_compare_engine_summary(right_entry)
+            pair_payload = {
+                "left": left_summary,
+                "right": right_summary,
+                "deltas": {
+                    "throughput_pct_left_vs_right": LeaderboardExporter._compute_relative_delta(
+                        left_summary["metrics"]["throughput_tps"],
+                        right_summary["metrics"]["throughput_tps"],
+                    ),
+                    "ttft_pct_left_vs_right": LeaderboardExporter._compute_relative_delta(
+                        left_summary["metrics"]["ttft_ms"],
+                        right_summary["metrics"]["ttft_ms"],
+                    ),
+                    "tbt_pct_left_vs_right": LeaderboardExporter._compute_relative_delta(
+                        left_summary["metrics"]["tbt_ms"],
+                        right_summary["metrics"]["tbt_ms"],
+                    ),
+                },
+                "winners": {
+                    "throughput": LeaderboardExporter._metric_winner(
+                        left_summary["metrics"]["throughput_tps"],
+                        right_summary["metrics"]["throughput_tps"],
+                        higher_is_better=True,
+                    ),
+                    "ttft": LeaderboardExporter._metric_winner(
+                        left_summary["metrics"]["ttft_ms"],
+                        right_summary["metrics"]["ttft_ms"],
+                        higher_is_better=False,
+                    ),
+                    "tbt": LeaderboardExporter._metric_winner(
+                        left_summary["metrics"]["tbt_ms"],
+                        right_summary["metrics"]["tbt_ms"],
+                        higher_is_better=False,
+                    ),
+                },
+            }
+
+            group_payload = {
+                "scope_key": group["scope_key"],
+                "category": group["category"],
+                "scope": group["scope"],
+                "engines": [
+                    LeaderboardExporter._build_compare_engine_summary(entry)
+                    for entry in representative_entries
+                ],
+                "preferred_pair": pair_payload,
+            }
+            groups_payload.append(group_payload)
+
+            if left_summary["engine"] == "sagellm" and right_summary["engine"] in {
+                "vllm",
+                "vllm-ascend",
+            }:
+                preferred_pairs.append(group_payload)
+
+        groups_payload.sort(key=lambda item: str(item["scope_key"]))
+        preferred_pairs.sort(key=lambda item: str(item["scope_key"]))
+        return {
+            "schema_version": LEADERBOARD_COMPARE_SNAPSHOT_SCHEMA_VERSION,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "group_count": len(groups_payload),
+            "preferred_pair_count": len(preferred_pairs),
+            "groups": groups_payload,
+            "preferred_pairs": preferred_pairs,
+        }
+
+    @staticmethod
     def _merge_hardware_info(artifact: dict[str, Any]) -> dict[str, Any]:
         canonical = dict(artifact.get("hardware") or {})
         cluster = dict(artifact.get("cluster") or {})
@@ -549,26 +828,95 @@ class LeaderboardExporter:
     def _build_metrics_from_canonical(artifact: dict[str, Any]) -> dict[str, Any]:
         metrics = dict(artifact.get("metrics") or {})
         return {
-            "ttft_ms": float(metrics.get("avg_ttft_ms") or 0.0),
-            "tbt_ms": float(metrics.get("avg_tbt_ms") or 0.0),
-            "tpot_ms": float(metrics.get("avg_tpot_ms") or 0.0),
-            "throughput_tps": float(
-                metrics.get("output_throughput_tps")
-                or metrics.get("avg_throughput_tps")
-                or metrics.get("total_throughput_tps")
-                or 0.0
+            "ttft_ms": LeaderboardExporter._require_number(
+                metrics.get("ttft_ms"), field_name="leaderboard entry.metrics.ttft_ms"
+            ),
+            "tbt_ms": LeaderboardExporter._require_number(
+                metrics.get("tbt_ms"), field_name="leaderboard entry.metrics.tbt_ms"
+            ),
+            "tpot_ms": LeaderboardExporter._require_number(
+                metrics.get("tpot_ms"), field_name="leaderboard entry.metrics.tpot_ms"
+            ),
+            "itl_ms": LeaderboardExporter._require_number(
+                metrics.get("itl_ms"), field_name="leaderboard entry.metrics.itl_ms"
+            ),
+            "p50_itl_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p50_itl_ms")),
+            "p95_itl_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p95_itl_ms")),
+            "p99_itl_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p99_itl_ms")),
+            "e2el_ms": LeaderboardExporter._require_number(
+                metrics.get("e2el_ms"), field_name="leaderboard entry.metrics.e2el_ms"
+            ),
+            "p50_e2el_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p50_e2el_ms")),
+            "p95_e2el_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p95_e2el_ms")),
+            "p99_e2el_ms": LeaderboardExporter._coerce_optional_float(metrics.get("p99_e2el_ms")),
+            "throughput_tps": LeaderboardExporter._require_number(
+                metrics.get("throughput_tps"), field_name="leaderboard entry.metrics.throughput_tps"
+            ),
+            "request_throughput_rps": LeaderboardExporter._require_number(
+                metrics.get("request_throughput_rps"),
+                field_name="leaderboard entry.metrics.request_throughput_rps",
+            ),
+            "input_throughput_tps": LeaderboardExporter._coerce_optional_float(
+                metrics.get("input_throughput_tps")
+            ),
+            "output_throughput_tps": LeaderboardExporter._require_number(
+                metrics.get("output_throughput_tps"),
+                field_name="leaderboard entry.metrics.output_throughput_tps",
+            ),
+            "total_throughput_tps": LeaderboardExporter._coerce_optional_float(
+                metrics.get("total_throughput_tps")
+            ),
+            "total_input_tokens": LeaderboardExporter._coerce_optional_int(
+                metrics.get("total_input_tokens")
+            ),
+            "total_output_tokens": LeaderboardExporter._coerce_optional_int(
+                metrics.get("total_output_tokens")
             ),
             "peak_mem_mb": int(metrics.get("peak_mem_mb") or 0),
             "error_rate": float(metrics.get("error_rate") or 0.0),
-            "prefix_hit_rate": float(metrics.get("avg_prefix_hit_rate") or 0.0),
-            "kv_used_tokens": int(metrics.get("total_kv_used_tokens") or 0),
-            "kv_used_bytes": int(metrics.get("total_kv_used_bytes") or 0),
-            "evict_count": int(metrics.get("total_evict_count") or 0),
-            "evict_ms": float(metrics.get("total_evict_ms") or 0.0),
-            "spec_accept_rate": float(metrics.get("avg_spec_accept_rate") or 0.0)
-            if metrics.get("avg_spec_accept_rate") is not None
-            else None,
+            "prefix_hit_rate": float(metrics.get("prefix_hit_rate") or 0.0),
+            "kv_used_tokens": int(metrics.get("kv_used_tokens") or 0),
+            "kv_used_bytes": int(metrics.get("kv_used_bytes") or 0),
+            "evict_count": int(metrics.get("evict_count") or 0),
+            "evict_ms": float(metrics.get("evict_ms") or 0.0),
+            "spec_accept_rate": LeaderboardExporter._coerce_optional_float(
+                metrics.get("spec_accept_rate")
+            ),
         }
+
+    @staticmethod
+    def _validate_stream_compare_export_source(artifact: dict[str, Any]) -> None:
+        schema_version = LeaderboardExporter._require_text(
+            artifact.get("schema_version"), field_name="canonical artifact.schema_version"
+        )
+        if schema_version != SUPPORTED_CANONICAL_EXPORT_SCHEMA_VERSION:
+            raise ValueError(
+                "leaderboard export requires canonical compare artifacts with "
+                f"schema_version {SUPPORTED_CANONICAL_EXPORT_SCHEMA_VERSION!r}"
+            )
+
+        if artifact.get("artifact_kind") != "execution_result":
+            raise ValueError(
+                "leaderboard export only supports canonical execution_result artifacts"
+            )
+
+        producer = LeaderboardExporter._require_mapping(
+            artifact.get("producer"), field_name="canonical artifact.producer"
+        )
+        if producer.get("command") != "compare":
+            raise ValueError(
+                "leaderboard export only supports canonical live compare artifacts; "
+                f"got producer.command={producer.get('command')!r}"
+            )
+
+        workload = LeaderboardExporter._require_mapping(
+            artifact.get("workload"), field_name="canonical artifact.workload"
+        )
+        if workload.get("mode") != "live-compare":
+            raise ValueError(
+                "leaderboard export only supports canonical live compare artifacts; "
+                f"got workload.mode={workload.get('mode')!r}"
+            )
 
     @staticmethod
     def _build_versions_from_payload(versions: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -609,10 +957,7 @@ class LeaderboardExporter:
         artifact: dict[str, Any],
         custom_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if artifact.get("artifact_kind") != "execution_result":
-            raise ValueError(
-                "Only execution_result canonical artifacts can be exported to leaderboard"
-            )
+        LeaderboardExporter._validate_stream_compare_export_source(artifact)
 
         producer = dict(artifact.get("producer") or {})
         provenance = dict(artifact.get("provenance") or {})
@@ -684,6 +1029,7 @@ class LeaderboardExporter:
             metadata.update(custom_metadata)
 
         entry = {
+            "schema_version": LEADERBOARD_ENTRY_SCHEMA_VERSION,
             "entry_id": str(uuid.uuid4()),
             "engine": engine,
             "engine_version": engine_version,
@@ -738,111 +1084,10 @@ class LeaderboardExporter:
         output_path: Path,
         custom_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        hardware = LeaderboardExporter.detect_hardware_info()
-        config_type = LeaderboardExporter.infer_config_type(
-            hardware["chip_count"], has_cluster=False
+        raise ValueError(
+            "Direct leaderboard export from AggregatedMetrics has been removed; "
+            "export only from canonical live compare artifacts"
         )
-        model_path = config.get("model_path", config.get("model", "unknown"))
-        model_name = model_path.split("/")[-1] if "/" in model_path else model_path
-        workload_spec = LeaderboardExporter._extract_workload_spec(workload_name)
-        component_versions, sagellm_version = LeaderboardExporter._build_versions_from_payload(
-            config.get("versions", {})
-        )
-
-        metadata_overrides = custom_metadata or {}
-        engine = LeaderboardExporter._normalize_engine_name(
-            metadata_overrides.get("engine")
-            or config.get("engine")
-            or config.get("runtime_engine")
-            or config.get("service")
-            or ("sagellm" if sagellm_version != "N/A" else "")
-        )
-        engine_version = str(
-            metadata_overrides.get("engine_version")
-            or LeaderboardExporter._resolve_version(
-                config.get("versions", {}),
-                (engine.replace("-", "_"), "sagellm", "sagellm_benchmark", "benchmark"),
-            )
-        )
-
-        entry = {
-            "entry_id": str(uuid.uuid4()),
-            "engine": engine,
-            "engine_version": engine_version,
-            "sagellm_version": sagellm_version,
-            "config_type": config_type,
-            "hardware": {
-                "vendor": LeaderboardExporter._normalize_vendor(hardware["vendor"]),
-                "chip_model": hardware["chip_model"],
-                "chip_count": hardware["chip_count"],
-                "interconnect": hardware["interconnect"],
-                "chips_per_node": hardware["chips_per_node"],
-                "intra_node_interconnect": hardware["intra_node_interconnect"],
-                "memory_per_chip_gb": hardware.get("memory_per_chip_gb"),
-                "total_memory_gb": hardware.get("total_memory_gb"),
-            },
-            "model": {
-                "name": model_name,
-                "parameters": "unknown",
-                "precision": "FP32",
-                "quantization": "None",
-            },
-            "workload": {
-                "name": workload_name,
-                "input_length": workload_spec["input_length"],
-                "output_length": workload_spec["output_length"],
-                "batch_size": workload_spec.get("batch_size"),
-                "concurrent_requests": workload_spec.get("concurrent_requests"),
-                "dataset": config.get("dataset", "default"),
-            },
-            "metrics": {
-                "ttft_ms": metrics.avg_ttft_ms,
-                "tbt_ms": metrics.avg_tbt_ms,
-                "tpot_ms": metrics.avg_tpot_ms,
-                "throughput_tps": metrics.avg_throughput_tps,
-                "peak_mem_mb": metrics.peak_mem_mb,
-                "error_rate": metrics.error_rate,
-                "prefix_hit_rate": metrics.avg_prefix_hit_rate,
-                "kv_used_tokens": metrics.total_kv_used_tokens,
-                "kv_used_bytes": metrics.total_kv_used_bytes,
-                "evict_count": metrics.total_evict_count,
-                "evict_ms": metrics.total_evict_ms,
-                "spec_accept_rate": metrics.avg_spec_accept_rate
-                if metrics.avg_spec_accept_rate > 0
-                else None,
-            },
-            "cluster": None,
-            "versions": component_versions,
-            "environment": LeaderboardExporter.detect_environment(),
-            "kv_cache_config": {
-                "enabled": True,
-                "eviction_policy": "LRU",
-                "budget_tokens": 8192,
-                "prefix_cache_enabled": True,
-            },
-            "metadata": {
-                "submitted_at": datetime.now(UTC).isoformat(),
-                "submitter": "sagellm-benchmark automated run",
-                "data_source": "automated-benchmark",
-                "engine": engine,
-                "engine_version": engine_version,
-                "reproducible_cmd": f"sagellm-benchmark run --workload {config.get('workload')} --backend {config.get('backend')} --model {config.get('model')}",
-                "git_commit": None,
-                "release_date": config.get("timestamp", "").split("T")[0]
-                if config.get("timestamp")
-                else None,
-                "changelog_url": "https://github.com/intellistream/sagellm/blob/main/CHANGELOG.md",
-                "notes": f"Benchmark run: {workload_name}",
-                "verified": False,
-            },
-        }
-        if custom_metadata:
-            entry["metadata"].update(custom_metadata)
-
-        entry = LeaderboardExporter.annotate_entry_identity(entry)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
-        return entry
 
     @staticmethod
     def annotate_entry_identity(entry: dict[str, Any]) -> dict[str, Any]:

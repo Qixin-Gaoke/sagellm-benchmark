@@ -83,8 +83,8 @@ sagellm-benchmark parity-gate evaluate \
 - Standardized JSON metrics and reports
 - One-command benchmark runner
 - Extensible backend support
-- Performance benchmark CLI (`perf`) for operator and E2E benchmark baselines
-- Canonical `compare` entrypoint for sagellm vs vllm/lmdeploy endpoint benchmarking
+- Performance benchmark CLI (`perf`) for operator baselines and single-endpoint E2E sampling
+- Canonical `compare` entrypoint for cross-engine live endpoint benchmarking
 - Convergence validation profile for shared-stream batching, block-table usage, and paged/native path evidence
 
 ## Dependencies
@@ -123,8 +123,9 @@ Dependency policy:
 Recommended benchmark mainline:
 
 - `sagellm-benchmark run` for local workload benchmarks.
-- `sagellm-benchmark compare` for live endpoint benchmarking.
-- `sagellm-benchmark vllm-compare run` only as a semantic convenience wrapper over `compare`.
+- `sagellm-benchmark perf --live` for single-endpoint operator/e2e collection only.
+- `sagellm-benchmark compare` as the only recommended cross-engine live benchmark entrypoint.
+- `sagellm-benchmark vllm-compare install-ascend` only as an environment/bootstrap helper for validated Ascend compare setup.
 - `./run_benchmark.sh` only as a compatibility shell wrapper.
 - `sagellm-benchmark report` only as a reporting helper over existing artifacts.
 
@@ -142,13 +143,46 @@ sagellm-benchmark report --input ./benchmark_results/benchmark_summary.json --fo
 sagellm-benchmark perf --type operator --device cpu
 sagellm-benchmark perf --type e2e --model Qwen/Qwen2-7B-Instruct --batch-size 1 --batch-size 4
 
+# Live perf stays on a single endpoint; use compare for engine-vs-engine runs
+sagellm-benchmark perf --type e2e --live \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --backend-url http://127.0.0.1:8901/v1
+
 # Compare multiple OpenAI-compatible endpoints through benchmark clients
 sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct
 
-# Run the explicit publish workflow after a compare completes
+# compare completion now also materializes a stable publish-ready snapshot directory at:
+# <output-dir>/publish/website-ready/
+# with leaderboard_single.json, leaderboard_multi.json,
+# leaderboard_compare.json, and last_updated.json.
+
+# Dataset-backed streaming serving benchmark over OpenAI-compatible endpoints
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8902/v1 \
+   --target vllm=http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --dataset-name random \
+   --num-prompts 128 \
+   --input-len 512 \
+   --output-len 128
+
+# Reuse sampled prompts from ShareGPT instead of synthetic random prompts
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8902/v1 \
+   --target vllm=http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
+   --model Qwen/Qwen2.5-0.5B-Instruct \
+   --dataset-name sharegpt \
+   --num-prompts 64 \
+   --input-len 1024 \
+   --output-len 256
+
+# Add --publish only when you also want the explicit HF dataset publish step.
 sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
@@ -157,18 +191,41 @@ sagellm-benchmark compare \
    --publish \
    --publish-hf-dataset intellistream/sagellm-benchmark-results
 
+# compare already writes those four snapshots locally under publish/website-ready/.
+# --publish only accepts the standard export boundary under the compare output,
+# regenerates the same publish-ready snapshots locally, and uploads them to HF.
+
+# Publish an existing compare output directory directly.
+sagellm-benchmark publish \
+   --input ./benchmark_results/compare \
+   --hf-dataset intellistream/sagellm-benchmark-results
+
 # Compatibility helpers for constrained environments: sequential capture, then offline summary.
 sagellm-benchmark compare-record \
    --label sagellm \
    --url http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-1.5B-Instruct \
    --output-dir ./benchmark_results/sequential/sagellm
 
 sagellm-benchmark compare-record \
    --label vllm \
    --url http://127.0.0.1:9100/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-1.5B-Instruct \
    --output-dir ./benchmark_results/sequential/vllm
+
+# Dataset-backed sequential capture for memory-constrained hosts
+sagellm-benchmark compare-record \
+   --label sagellm \
+   --url http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
+   --model Qwen/Qwen2.5-1.5B-Instruct \
+   --dataset-name sharegpt \
+   --num-prompts 64 \
+   --input-len 1024 \
+   --output-len 256 \
+   --output-dir ./benchmark_results/sequential/sagellm
 
 sagellm-benchmark compare-offline \
    --result sagellm=./benchmark_results/sequential/sagellm/sagellm.json \
@@ -184,6 +241,7 @@ sagellm-benchmark compare-offline \
 sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
    --prompt-cleanup
 
@@ -193,28 +251,32 @@ sagellm-benchmark compare \
    --target vllm=http://127.0.0.1:8000/v1 \
    --target-command "sagellm=sagellm serve --backend cuda --model Qwen/Qwen2.5-0.5B-Instruct --port 8902" \
    --target-command "vllm=vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8000" \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
    --prompt-cleanup
 
-# Semantic convenience wrapper over `compare` for the standard sageLLM vs vLLM layout
-sagellm-benchmark vllm-compare run \
-   --sagellm-url http://127.0.0.1:8901/v1 \
-   --vllm-url http://127.0.0.1:8000/v1 \
+# Standard sageLLM vs vLLM compare on the canonical mainline
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8901/v1 \
+   --target vllm=http://127.0.0.1:8000/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct
 
 # Prompt to clean up the locally running SageLLM/vLLM endpoints afterwards.
-sagellm-benchmark vllm-compare run \
-   --sagellm-url http://127.0.0.1:8901/v1 \
-   --vllm-url http://127.0.0.1:8000/v1 \
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8901/v1 \
+   --target vllm=http://127.0.0.1:8000/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
    --prompt-cleanup
 
 # Optionally auto-start local SageLLM/vLLM endpoints if they are not up yet.
-sagellm-benchmark vllm-compare run \
-   --sagellm-url http://127.0.0.1:8901/v1 \
-   --vllm-url http://127.0.0.1:8000/v1 \
-   --start-sagellm-cmd "sagellm serve --backend cuda --model Qwen/Qwen2.5-0.5B-Instruct --port 8901" \
-   --start-vllm-cmd "vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8000" \
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8901/v1 \
+   --target vllm=http://127.0.0.1:8000/v1 \
+   --target-command "sagellm=sagellm serve --backend cuda --model Qwen/Qwen2.5-0.5B-Instruct --port 8901" \
+   --target-command "vllm=vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8000" \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
    --prompt-cleanup
 
@@ -223,16 +285,18 @@ sagellm-benchmark vllm-compare run \
 VLLM_GPU_DEVICE=1 VLLM_PORT=9100 \
    ./scripts/start_vllm_cuda_docker.sh
 
-sagellm-benchmark vllm-compare run \
-   --sagellm-url http://127.0.0.1:8901/v1 \
-   --vllm-url http://127.0.0.1:9100/v1 \
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8901/v1 \
+   --target vllm=http://127.0.0.1:9100/v1 \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-1.5B-Instruct
 
 # Or let compare bootstrap the Dockerized vLLM endpoint on demand.
-sagellm-benchmark vllm-compare run \
-   --sagellm-url http://127.0.0.1:8901/v1 \
-   --vllm-url http://127.0.0.1:9100/v1 \
-   --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+sagellm-benchmark compare \
+   --target sagellm=http://127.0.0.1:8901/v1 \
+   --target vllm=http://127.0.0.1:9100/v1 \
+   --target-command "vllm=./scripts/start_vllm_cuda_docker.sh" \
+   --hardware-family cuda \
    --model Qwen/Qwen2.5-1.5B-Instruct
 
 # If startup fails, logs remain available because the helper does not use
@@ -270,6 +334,81 @@ sagellm-benchmark publish \
    --log-file after=/tmp/sagellm-after.log \
    --model Qwen/Qwen2.5-0.5B-Instruct
 ```
+
+## Streaming Serving Benchmark
+
+The canonical serving benchmark path is the stream-based `compare` pipeline. It talks to OpenAI-compatible `/v1/chat/completions` endpoints with `stream=true`, then aggregates request-level streaming metrics including TTFT, ITL, TPOT, E2EL, input throughput, output throughput, and request throughput.
+
+`/v1/completions` with `stream=true` is not part of the benchmark support boundary. The benchmark client fails fast and only accepts `/v1/chat/completions` for streaming serving runs.
+
+- Use `compare` for all real cross-engine comparisons.
+- Use `compare-record` plus `compare-offline` when endpoints cannot stay up at the same time.
+- `perf --live` remains a single-endpoint sampling path only; it is not the recommended engine-vs-engine benchmark entry.
+
+## Canonical Publish Chain
+
+The productized compare path is now:
+
+1. `compare` captures streaming endpoint results and writes `*.canonical.json`.
+2. `export_standard_leaderboard_artifacts()` derives `*_leaderboard.json` plus `leaderboard_manifest.json`.
+3. The compare command itself writes a stable local publish-ready directory at `<compare-output>/publish/website-ready/` with:
+   - `leaderboard_single.json`
+   - `leaderboard_multi.json`
+   - `leaderboard_compare.json`
+   - `last_updated.json`
+4. `publish` reuses that same output boundary, uploads canonical per-entry JSON into the HF dataset, and optionally syncs the snapshot files into `sagellm-website/data/`.
+5. website consumes only those standard snapshots from HF or from a locally synced compatibility cache.
+
+`leaderboard_compare.json` is a derived website artifact, not a second benchmark result schema. It is generated strictly from validated leaderboard entries so the website can directly render `sageLLM vs vLLM` deltas without hand-editing JSON.
+
+Prompt source options for the stream compare pipeline:
+
+- `--dataset-name default`: built-in short/long serving scenarios per batch size.
+- `--dataset-name random`: synthetic prompts sampled through the serving dataset builder.
+- `--dataset-name sharegpt`: ShareGPT-backed prompts sampled through the same serving dataset builder.
+
+Dataset-backed compare requires the full tuple `--dataset-name`, `--num-prompts`, `--input-len`, and `--output-len`. This keeps the transport and aggregation path unchanged while swapping prompt corpora and token budgets.
+
+## Traffic Shaping API
+
+`request_rate`, `burstiness`, and `ramp_up` are currently benchmark traffic-model capabilities exposed through the Python API, not through `compare` CLI flags yet. Use them when you need controlled arrival shaping for custom serving harnesses, while keeping `compare` as the canonical cross-engine artifact producer.
+
+```python
+from sagellm_benchmark import ArrivalPattern, RampUpStrategy, TrafficProfile
+from sagellm_benchmark.datasets.serving import build_serving_requests
+from sagellm_benchmark.traffic import RequestGenerator
+
+requests = build_serving_requests(
+   dataset_name="sharegpt",
+   num_prompts=128,
+   input_len=512,
+   output_len=128,
+   model="Qwen/Qwen2.5-0.5B-Instruct",
+   stream=True,
+   seed=7,
+)
+
+profile = TrafficProfile(
+   pattern=ArrivalPattern.GAMMA,
+   request_rate=8.0,
+   burstiness=0.6,
+   num_prompts=128,
+   ramp_up_strategy=RampUpStrategy.LINEAR,
+   ramp_up_requests=32,
+   ramp_up_start_factor=0.25,
+   seed=7,
+)
+
+generator = RequestGenerator(requests, profile)
+```
+
+Interpretation rules for the traffic knobs:
+
+- `request_rate`: target requests per second. `inf`, `0`, or `None` normalize to unlimited submission.
+- `burstiness`: Gamma shape parameter. `1.0` is Poisson-like, values below `1.0` are burstier, values above `1.0` are more even.
+- `ramp_up_strategy`: `linear` or `exponential` climb toward the configured request rate.
+- `ramp_up_requests`: number of early requests that participate in the climb.
+- `ramp_up_start_factor`: initial rate as a fraction of the target request rate.
 
 When validating the mainline architecture rather than just endpoint speed, preserve three artifact classes together:
 

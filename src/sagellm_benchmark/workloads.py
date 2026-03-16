@@ -292,7 +292,7 @@ STREAMING_WORKLOADS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Batch inference workloads (offline throughput)
+# Batch inference workloads (local batch submission)
 # ---------------------------------------------------------------------------
 
 BATCH_INFERENCE_WORKLOADS = [

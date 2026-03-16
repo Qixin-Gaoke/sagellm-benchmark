@@ -12,11 +12,44 @@ from typing import Any
 from sagellm_benchmark.exporters import LeaderboardExporter
 from sagellm_benchmark.types import AggregatedMetrics
 
-CANONICAL_RESULT_SCHEMA_VERSION = "canonical-benchmark-result/v1"
+CANONICAL_RESULT_SCHEMA_VERSION = "canonical-benchmark-result/v2"
 
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _default_hardware_metadata(hardware_family: str) -> dict[str, Any]:
+    normalized = hardware_family.strip().lower()
+    defaults = {
+        "vendor": "Unknown",
+        "chip_model": hardware_family or "unknown",
+        "chip_count": 1,
+        "chips_per_node": 1,
+        "interconnect": "None",
+        "node_count": 1,
+    }
+    if normalized == "cuda":
+        defaults.update(
+            {
+                "vendor": "NVIDIA",
+                "chip_model": "CUDA",
+            }
+        )
+    elif normalized == "ascend":
+        defaults.update(
+            {
+                "vendor": "Huawei",
+                "chip_model": "Ascend",
+            }
+        )
+    elif normalized == "cpu":
+        defaults.update(
+            {
+                "chip_model": "CPU",
+            }
+        )
+    return defaults
 
 
 def _require_text(value: str, field_name: str) -> str:
@@ -38,6 +71,71 @@ def _coerce_metrics(metrics: AggregatedMetrics | dict[str, Any]) -> dict[str, An
     if isinstance(metrics, dict):
         return dict(metrics)
     raise TypeError(f"Unsupported metrics payload type: {type(metrics)!r}")
+
+
+def _require_metric_number(metrics: dict[str, Any], field_name: str) -> float:
+    value = metrics.get(field_name)
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"live compare summary requires numeric field {field_name!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"live compare summary requires numeric field {field_name!r}") from exc
+
+
+def _optional_metric_number(metrics: dict[str, Any], field_name: str) -> float | None:
+    value = metrics.get(field_name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"live compare summary field {field_name!r} must be numeric") from exc
+
+
+def _optional_metric_int(metrics: dict[str, Any], field_name: str) -> int | None:
+    value = metrics.get(field_name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"live compare summary field {field_name!r} must be an integer") from exc
+
+
+def _build_live_compare_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    summary_payload = dict(summary)
+    output_throughput_tps = _require_metric_number(summary_payload, "avg_output_throughput_tps")
+    return {
+        "ttft_ms": _require_metric_number(summary_payload, "avg_ttft_ms"),
+        "tbt_ms": _require_metric_number(summary_payload, "avg_tbt_ms"),
+        "tpot_ms": _require_metric_number(summary_payload, "avg_tpot_ms"),
+        "itl_ms": _require_metric_number(summary_payload, "avg_itl_ms"),
+        "p50_itl_ms": _optional_metric_number(summary_payload, "p50_itl_ms"),
+        "p95_itl_ms": _optional_metric_number(summary_payload, "p95_itl_ms"),
+        "p99_itl_ms": _optional_metric_number(summary_payload, "p99_itl_ms"),
+        "e2el_ms": _require_metric_number(summary_payload, "avg_e2el_ms"),
+        "p50_e2el_ms": _optional_metric_number(summary_payload, "p50_e2el_ms"),
+        "p95_e2el_ms": _optional_metric_number(summary_payload, "p95_e2el_ms"),
+        "p99_e2el_ms": _optional_metric_number(summary_payload, "p99_e2el_ms"),
+        "throughput_tps": output_throughput_tps,
+        "request_throughput_rps": _require_metric_number(
+            summary_payload, "avg_request_throughput_rps"
+        ),
+        "input_throughput_tps": _optional_metric_number(summary_payload, "input_throughput_tps"),
+        "output_throughput_tps": output_throughput_tps,
+        "total_throughput_tps": _optional_metric_number(summary_payload, "total_throughput_tps"),
+        "total_input_tokens": _optional_metric_int(summary_payload, "total_input_tokens"),
+        "total_output_tokens": _optional_metric_int(summary_payload, "total_output_tokens"),
+        "peak_mem_mb": int(float(summary_payload.get("peak_mem_mb") or 0.0)),
+        "error_rate": float(summary_payload.get("error_rate") or 0.0),
+        "prefix_hit_rate": float(summary_payload.get("prefix_hit_rate") or 0.0),
+        "kv_used_tokens": int(float(summary_payload.get("kv_used_tokens") or 0.0)),
+        "kv_used_bytes": int(float(summary_payload.get("kv_used_bytes") or 0.0)),
+        "evict_count": int(float(summary_payload.get("evict_count") or 0.0)),
+        "evict_ms": float(summary_payload.get("evict_ms") or 0.0),
+        "spec_accept_rate": _optional_metric_number(summary_payload, "spec_accept_rate"),
+    }
 
 
 def _resolve_engine_version(label: str, versions: dict[str, Any] | None) -> str | None:
@@ -99,6 +197,7 @@ def _artifact_base(
         "provenance": artifact_provenance,
         "hardware": {
             "family": hardware_family,
+            **_default_hardware_metadata(hardware_family),
         },
         "engine": {
             "name": engine_name,
@@ -229,7 +328,7 @@ def build_live_compare_artifact(
                 }
             ),
         },
-        metrics=summary,
+        metrics=_build_live_compare_metrics(summary),
         measurements={
             "summary": dict(summary),
             "rows": list(rows),
@@ -400,6 +499,10 @@ def export_standard_leaderboard_artifacts(input_dir: Path | str) -> dict[str, An
     for canonical_path, artifact in artifacts:
         if artifact.get("artifact_kind") != "execution_result":
             continue
+        producer = artifact.get("producer") if isinstance(artifact.get("producer"), dict) else {}
+        workload = artifact.get("workload") if isinstance(artifact.get("workload"), dict) else {}
+        if producer.get("command") != "compare" or workload.get("mode") != "live-compare":
+            continue
 
         file_stem = canonical_path.name.removesuffix(".canonical.json")
         leaderboard_path = canonical_path.with_name(f"{file_stem}_leaderboard.json")
@@ -422,7 +525,9 @@ def export_standard_leaderboard_artifacts(input_dir: Path | str) -> dict[str, An
         )
 
     if not exported:
-        raise ValueError(f"No execution_result canonical artifacts found under: {input_path}")
+        raise ValueError(
+            f"No canonical live-compare execution_result artifacts found under: {input_path}"
+        )
 
     return {
         "validated_count": len(artifacts),

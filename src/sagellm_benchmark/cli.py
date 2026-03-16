@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -31,6 +30,7 @@ from sagellm_benchmark.canonical_artifacts import (
     export_standard_leaderboard_artifacts,
     write_canonical_artifact,
 )
+from sagellm_benchmark.compare_runner import run_stream_compare_target
 from sagellm_benchmark.core_telemetry import build_core_decode_telemetry_artifact
 from sagellm_benchmark.exporters import LeaderboardExporter
 from sagellm_benchmark.nonstream_compare import (
@@ -55,6 +55,7 @@ console = Console()
 HF_SNAPSHOT_FILES = {
     "single": "leaderboard_single.json",
     "multi": "leaderboard_multi.json",
+    "compare": "leaderboard_compare.json",
     "marker": "last_updated.json",
 }
 DEFAULT_PUBLISH_DATASET = "intellistream/sagellm-benchmark-results"
@@ -73,24 +74,22 @@ def _print_compatibility_layer_notice(
     )
 
 
-def _export_compatibility_leaderboard_artifacts(
+def _export_stream_leaderboard_artifacts(
     *,
     benchmark_output_dir: Path,
     source_command: str,
 ) -> dict[str, object]:
     console.print(
-        "[yellow]Compatibility export:[/yellow] "
-        f"{source_command} writes canonical artifacts first; "
-        "*_leaderboard.json and leaderboard_manifest.json are derived compatibility artifacts "
-        "for legacy website/HF consumers only."
+        "[cyan]Leaderboard export:[/cyan] "
+        f"{source_command} derives leaderboard artifacts from canonical live-compare outputs only."
     )
     try:
         export_summary = export_standard_leaderboard_artifacts(benchmark_output_dir)
     except Exception as exc:
-        raise click.ClickException(f"compatibility leaderboard export failure: {exc}") from exc
+        raise click.ClickException(f"leaderboard export failure: {exc}") from exc
 
     console.print(
-        f"[green]✓[/green] compatibility export: validated {export_summary['validated_count']} canonical artifacts, "
+        f"[green]✓[/green] leaderboard export: validated {export_summary['validated_count']} canonical artifacts, "
         f"exported {export_summary['exported_count']} leaderboard artifacts"
     )
     console.print(f"Manifest: {export_summary['manifest_path']}")
@@ -98,15 +97,6 @@ def _export_compatibility_leaderboard_artifacts(
 
 
 def _add_publish_options(command):
-    command = click.option(
-        "--publish-website-dir",
-        type=click.Path(file_okay=False, dir_okay=True),
-        default=None,
-        help=(
-            "Optional sagellm-website repo root. When set, publish will sync generated "
-            "website-ready snapshots into <website>/data/."
-        ),
-    )(command)
     command = click.option(
         "--publish-hf-private/--publish-hf-public",
         default=False,
@@ -128,7 +118,7 @@ def _add_publish_options(command):
     command = click.option(
         "--publish-dry-run/--no-publish-dry-run",
         default=False,
-        help="Validate and preview the publish workflow without uploading or syncing files.",
+        help="Validate and preview the publish workflow without uploading.",
     )(command)
     command = click.option(
         "--publish/--no-publish",
@@ -193,16 +183,19 @@ def _upload_hf_exports(
         raise click.ClickException("No valid leaderboard entries found for upload")
 
     remote_entries: list[dict] = []
+    remote_snapshot_payloads: dict[str, object] = {}
+    remote_snapshot_presence: dict[str, bool] = {}
     api = None
     if not dry_run:
         api = hf_api_cls(endpoint=hf_endpoint, token=resolved_token)
-
+        dataset_exists = True
         try:
             api.repo_info(repo_id=dataset, repo_type="dataset")
         except Exception:
+            dataset_exists = False
             api.create_repo(repo_id=dataset, repo_type="dataset", private=private)
 
-        for snapshot_name in (HF_SNAPSHOT_FILES["single"], HF_SNAPSHOT_FILES["multi"]):
+        for snapshot_name in HF_SNAPSHOT_FILES.values():
             try:
                 remote_file = hf_hub_download(
                     repo_id=dataset,
@@ -212,12 +205,37 @@ def _upload_hf_exports(
                     endpoint=hf_endpoint,
                 )
             except Exception:
+                remote_snapshot_presence[snapshot_name] = False
                 continue
 
-            remote_payload = json.loads(Path(remote_file).read_text(encoding="utf-8"))
+            remote_snapshot_presence[snapshot_name] = True
+            remote_snapshot_payloads[snapshot_name] = json.loads(
+                Path(remote_file).read_text(encoding="utf-8")
+            )
+
+        if dataset_exists:
+            present_snapshots = [
+                snapshot_name
+                for snapshot_name, exists in remote_snapshot_presence.items()
+                if exists
+            ]
+            missing_snapshots = [
+                snapshot_name
+                for snapshot_name in HF_SNAPSHOT_FILES.values()
+                if not remote_snapshot_presence.get(snapshot_name, False)
+            ]
+            if present_snapshots and missing_snapshots:
+                raise click.ClickException(
+                    "Remote dataset is missing required standard snapshot files: "
+                    + ", ".join(sorted(missing_snapshots))
+                )
+
+        for snapshot_name in (HF_SNAPSHOT_FILES["single"], HF_SNAPSHOT_FILES["multi"]):
+            remote_payload = remote_snapshot_payloads.get(snapshot_name)
+            if remote_payload is None:
+                continue
             if not isinstance(remote_payload, list):
                 raise click.ClickException(f"Remote snapshot {snapshot_name} is not a JSON array")
-
             for index, entry in enumerate(remote_payload):
                 remote_entries.append(
                     LeaderboardExporter.validate_leaderboard_entry(
@@ -226,10 +244,19 @@ def _upload_hf_exports(
                     )
                 )
 
+        remote_marker_payload = remote_snapshot_payloads.get(HF_SNAPSHOT_FILES["marker"])
+        if remote_marker_payload is not None and (
+            not isinstance(remote_marker_payload, dict)
+            or not isinstance(remote_marker_payload.get("last_updated"), str)
+        ):
+            raise click.ClickException(
+                f"Remote snapshot {HF_SNAPSHOT_FILES['marker']} must be a JSON object with last_updated"
+            )
+
     merged_entries = list(remote_entries)
     merged_entries.extend(canonical_entries.values())
     snapshots = LeaderboardExporter.build_snapshot_payloads(merged_entries)
-    marker_payload = {"last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}
+    compare_snapshot = LeaderboardExporter.build_compare_snapshot(merged_entries)
 
     if dry_run:
         return {
@@ -239,12 +266,16 @@ def _upload_hf_exports(
             "snapshot_counts": {
                 "single": len(snapshots["single"]),
                 "multi": len(snapshots["multi"]),
+                "compare_groups": int(compare_snapshot["group_count"]),
+                "preferred_pairs": int(compare_snapshot["preferred_pair_count"]),
             },
         }
 
     upload_errors: list[str] = []
     skipped_count = 0
     uploaded_count = 0
+    snapshot_uploaded_count = 0
+    snapshot_skipped_count = 0
     with Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -301,12 +332,19 @@ def _upload_hf_exports(
             finally:
                 progress.advance(task)
 
-    for snapshot_name, payload in (
-        (HF_SNAPSHOT_FILES["single"], snapshots["single"]),
-        (HF_SNAPSHOT_FILES["multi"], snapshots["multi"]),
-        (HF_SNAPSHOT_FILES["marker"], marker_payload),
-    ):
+    snapshot_payloads = {
+        HF_SNAPSHOT_FILES["single"]: snapshots["single"],
+        HF_SNAPSHOT_FILES["multi"]: snapshots["multi"],
+        HF_SNAPSHOT_FILES["compare"]: compare_snapshot,
+    }
+    snapshot_changes_detected = uploaded_count > 0
+    for snapshot_name, payload in snapshot_payloads.items():
         try:
+            remote_payload = remote_snapshot_payloads.get(snapshot_name)
+            if remote_payload == payload:
+                snapshot_skipped_count += 1
+                continue
+
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".json", encoding="utf-8", delete=False
             ) as temp_file:
@@ -322,9 +360,37 @@ def _upload_hf_exports(
                     f"Update HF leaderboard snapshot {snapshot_name} ({datetime.now().isoformat()})"
                 ),
             )
+            snapshot_uploaded_count += 1
+            snapshot_changes_detected = True
             Path(temp_path).unlink(missing_ok=True)
         except Exception as exc:
             upload_errors.append(f"{snapshot_name}: {exc}")
+
+    marker_payload = remote_snapshot_payloads.get(HF_SNAPSHOT_FILES["marker"])
+    if snapshot_changes_detected or marker_payload is None:
+        marker_payload = {"last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", encoding="utf-8", delete=False
+            ) as temp_file:
+                json.dump(marker_payload, temp_file, indent=2)
+                temp_path = temp_file.name
+
+            api.upload_file(
+                path_or_fileobj=temp_path,
+                path_in_repo=HF_SNAPSHOT_FILES["marker"],
+                repo_id=dataset,
+                repo_type="dataset",
+                commit_message=(
+                    f"Update HF leaderboard snapshot {HF_SNAPSHOT_FILES['marker']} ({datetime.now().isoformat()})"
+                ),
+            )
+            snapshot_uploaded_count += 1
+            Path(temp_path).unlink(missing_ok=True)
+        except Exception as exc:
+            upload_errors.append(f"{HF_SNAPSHOT_FILES['marker']}: {exc}")
+    else:
+        snapshot_skipped_count += 1
 
     if upload_errors:
         raise click.ClickException("\n".join(upload_errors))
@@ -335,9 +401,13 @@ def _upload_hf_exports(
         "canonical_entry_count": len(canonical_entries),
         "uploaded_count": uploaded_count,
         "skipped_count": skipped_count,
+        "snapshot_uploaded_count": snapshot_uploaded_count,
+        "snapshot_skipped_count": snapshot_skipped_count,
         "snapshot_counts": {
             "single": len(snapshots["single"]),
             "multi": len(snapshots["multi"]),
+            "compare_groups": int(compare_snapshot["group_count"]),
+            "preferred_pairs": int(compare_snapshot["preferred_pair_count"]),
         },
     }
 
@@ -345,10 +415,12 @@ def _upload_hf_exports(
 def _write_website_ready_data(input_dir: Path) -> dict[str, object]:
     entries = _load_standard_leaderboard_entries(input_dir)
     snapshots = LeaderboardExporter.build_snapshot_payloads(entries)
+    compare_snapshot = LeaderboardExporter.build_compare_snapshot(entries)
     website_ready_dir = input_dir / "publish" / "website-ready"
     outputs = {
         HF_SNAPSHOT_FILES["single"]: snapshots["single"],
         HF_SNAPSHOT_FILES["multi"]: snapshots["multi"],
+        HF_SNAPSHOT_FILES["compare"]: compare_snapshot,
         HF_SNAPSHOT_FILES["marker"]: {
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         },
@@ -361,52 +433,10 @@ def _write_website_ready_data(input_dir: Path) -> dict[str, object]:
         "snapshot_counts": {
             "single": len(snapshots["single"]),
             "multi": len(snapshots["multi"]),
+            "compare_groups": int(compare_snapshot["group_count"]),
+            "preferred_pairs": int(compare_snapshot["preferred_pair_count"]),
         },
         "files": written_files,
-    }
-
-
-def _sync_website_ready_data(
-    *,
-    website_ready_dir: Path,
-    website_dir: str | None,
-    dry_run: bool,
-) -> dict[str, object]:
-    target_root = Path(website_dir).expanduser() if website_dir else None
-    if target_root is None:
-        return {
-            "mode": "website-ready",
-            "dry_run": dry_run,
-            "synced": False,
-        }
-
-    data_dir = target_root / "data"
-    if dry_run:
-        return {
-            "mode": "website-sync",
-            "dry_run": True,
-            "synced": False,
-            "target_dir": str(data_dir),
-        }
-
-    if not data_dir.is_dir():
-        raise click.ClickException(f"Website data directory not found: {data_dir}")
-
-    copied_files: list[str] = []
-    for file_name in HF_SNAPSHOT_FILES.values():
-        source = website_ready_dir / file_name
-        if not source.is_file():
-            raise click.ClickException(f"Missing website-ready snapshot: {source}")
-        target = data_dir / file_name
-        shutil.copy2(source, target)
-        copied_files.append(str(target))
-
-    return {
-        "mode": "website-sync",
-        "dry_run": False,
-        "synced": True,
-        "target_dir": str(data_dir),
-        "copied_files": copied_files,
     }
 
 
@@ -416,7 +446,6 @@ def _run_publish_workflow(
     publish_hf_dataset: str,
     publish_hf_token: str | None,
     publish_hf_private: bool,
-    publish_website_dir: str | None,
     publish_dry_run: bool,
 ) -> None:
     console.print("\n[bold cyan]sageLLM Publish Workflow[/bold cyan]")
@@ -424,14 +453,7 @@ def _run_publish_workflow(
     console.print(f"Dry-run: {publish_dry_run}")
 
     try:
-        _export_compatibility_leaderboard_artifacts(
-            benchmark_output_dir=benchmark_output_dir,
-            source_command="publish",
-        )
-    except Exception as exc:
-        raise click.ClickException(f"publish export failure: {exc}") from exc
-
-    try:
+        website_summary = _write_website_ready_data(benchmark_output_dir)
         upload_summary = _upload_hf_exports(
             dataset=publish_hf_dataset,
             input_dir=benchmark_output_dir,
@@ -440,7 +462,7 @@ def _run_publish_workflow(
             dry_run=publish_dry_run,
         )
     except Exception as exc:
-        raise click.ClickException(f"publish upload failure: {exc}") from exc
+        raise click.ClickException(f"publish failure: {exc}") from exc
 
     if upload_summary["dry_run"]:
         console.print(
@@ -451,41 +473,52 @@ def _run_publish_workflow(
     else:
         console.print(
             f"[green]✓[/green] upload: uploaded {upload_summary['uploaded_count']} entries, "
-            f"skipped {upload_summary['skipped_count']}"
+            f"skipped {upload_summary['skipped_count']}; snapshots uploaded {upload_summary['snapshot_uploaded_count']}, "
+            f"skipped {upload_summary['snapshot_skipped_count']}"
         )
-
-    try:
-        website_summary = _write_website_ready_data(benchmark_output_dir)
-        website_sync_summary = _sync_website_ready_data(
-            website_ready_dir=Path(website_summary["output_dir"]),
-            website_dir=publish_website_dir,
-            dry_run=publish_dry_run,
-        )
-    except Exception as exc:
-        raise click.ClickException(f"publish website sync failure: {exc}") from exc
 
     console.print(
-        f"[green]✓[/green] website-ready: single={website_summary['snapshot_counts']['single']}, "
-        f"multi={website_summary['snapshot_counts']['multi']}"
+        f"[green]✓[/green] publish-ready: single={website_summary['snapshot_counts']['single']}, "
+        f"multi={website_summary['snapshot_counts']['multi']}, "
+        f"compare_groups={website_summary['snapshot_counts']['compare_groups']}"
     )
+    console.print(f"Publish-ready output: {website_summary['output_dir']}")
+
+
+def _prepare_compare_publish_ready_outputs(
+    *,
+    benchmark_output_dir: Path,
+    source_command: str,
+) -> dict[str, object]:
+    """Finalize standard compare outputs for downstream publish and website consumption."""
+    try:
+        export_summary = _export_stream_leaderboard_artifacts(
+            benchmark_output_dir=benchmark_output_dir,
+            source_command=source_command,
+        )
+        website_summary = _write_website_ready_data(benchmark_output_dir)
+    except Exception as exc:
+        raise click.ClickException(f"{source_command} output finalization failure: {exc}") from exc
+
+    console.print(
+        f"[green]✓[/green] publish-ready: leaderboard={export_summary['exported_count']}, "
+        f"single={website_summary['snapshot_counts']['single']}, "
+        f"multi={website_summary['snapshot_counts']['multi']}, "
+        f"compare_groups={website_summary['snapshot_counts']['compare_groups']}"
+    )
+    console.print(f"Manifest: {export_summary['manifest_path']}")
     console.print(f"Website-ready output: {website_summary['output_dir']}")
-    if website_sync_summary["mode"] == "website-sync":
-        if website_sync_summary["dry_run"]:
-            console.print(
-                f"[green]✓[/green] website sync dry-run: would sync snapshots into {website_sync_summary['target_dir']}"
-            )
-        else:
-            console.print(
-                f"[green]✓[/green] website sync: copied {len(website_sync_summary['copied_files'])} files into {website_sync_summary['target_dir']}"
-            )
+    return {
+        "export_summary": export_summary,
+        "website_summary": website_summary,
+    }
 
 
-def _apply_vllm_compare_safe_env_defaults(hardware_family: str) -> None:
+def _apply_compare_safe_env_defaults(hardware_family: str) -> None:
     """Apply benchmark-safe environment defaults for compare workflows.
 
-    Ascend compare runs are especially sensitive to implicit `torch_npu`
-    autoload and unreachable default Hugging Face endpoints, so set defensive
-    defaults unless the caller already provided explicit values.
+    Compare and compare-record may need tokenizer/config probes before talking
+    to live endpoints, so keep the defensive defaults on the compare mainline.
     """
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     if hardware_family.strip().lower() == "ascend":
@@ -559,7 +592,12 @@ def _build_compare_summary(target_results: list[dict[str, object]]) -> dict[str,
     baseline_summary = baseline["summary"]
     baseline_ttft = float(baseline_summary["avg_ttft_ms"])
     baseline_tbt = float(baseline_summary["avg_tbt_ms"])
+    baseline_tpot = float(baseline_summary.get("avg_tpot_ms", 0.0))
+    baseline_itl = float(baseline_summary.get("avg_itl_ms", 0.0))
+    baseline_e2el = float(baseline_summary.get("avg_e2el_ms", 0.0))
     baseline_tps = float(baseline_summary["avg_throughput_tps"])
+    baseline_output_tps = float(baseline_summary.get("avg_output_throughput_tps", baseline_tps))
+    baseline_rps = float(baseline_summary.get("avg_request_throughput_rps", 0.0))
 
     summary_rows: list[dict[str, object]] = []
     for target in target_results:
@@ -571,11 +609,35 @@ def _build_compare_summary(target_results: list[dict[str, object]]) -> dict[str,
                 "rows": int(target_summary["total_rows"]),
                 "avg_ttft_ms": float(target_summary["avg_ttft_ms"]),
                 "avg_tbt_ms": float(target_summary["avg_tbt_ms"]),
+                "avg_tpot_ms": float(target_summary.get("avg_tpot_ms", 0.0)),
+                "avg_itl_ms": float(target_summary.get("avg_itl_ms", 0.0)),
+                "avg_e2el_ms": float(target_summary.get("avg_e2el_ms", 0.0)),
                 "avg_throughput_tps": float(target_summary["avg_throughput_tps"]),
+                "avg_output_throughput_tps": float(
+                    target_summary.get(
+                        "avg_output_throughput_tps", target_summary["avg_throughput_tps"]
+                    )
+                ),
+                "avg_request_throughput_rps": float(
+                    target_summary.get("avg_request_throughput_rps", 0.0)
+                ),
                 "delta_vs_baseline": {
                     "ttft_ms": float(target_summary["avg_ttft_ms"]) - baseline_ttft,
                     "tbt_ms": float(target_summary["avg_tbt_ms"]) - baseline_tbt,
+                    "tpot_ms": float(target_summary.get("avg_tpot_ms", 0.0)) - baseline_tpot,
+                    "itl_ms": float(target_summary.get("avg_itl_ms", 0.0)) - baseline_itl,
+                    "e2el_ms": float(target_summary.get("avg_e2el_ms", 0.0)) - baseline_e2el,
                     "throughput_tps": float(target_summary["avg_throughput_tps"]) - baseline_tps,
+                    "output_throughput_tps": float(
+                        target_summary.get(
+                            "avg_output_throughput_tps", target_summary["avg_throughput_tps"]
+                        )
+                    )
+                    - baseline_output_tps,
+                    "request_throughput_rps": float(
+                        target_summary.get("avg_request_throughput_rps", 0.0)
+                    )
+                    - baseline_rps,
                 },
             }
         )
@@ -595,21 +657,25 @@ def _format_compare_markdown(compare_result: dict[str, object]) -> str:
         f"- Baseline: {compare_result['baseline']}",
         f"- Batch sizes: {', '.join(str(size) for size in compare_result['batch_sizes'])}",
         "",
-        "| Target | Rows | Avg TTFT (ms) | Avg TBT (ms) | Avg TPS | Delta TTFT | Delta TBT | Delta TPS |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Target | Rows | Avg TTFT (ms) | Avg ITL (ms) | Avg TPOT (ms) | Avg E2EL (ms) | Avg TPS | Delta TTFT | Delta ITL | Delta TPOT | Delta E2EL | Delta TPS |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     for target in compare_result["targets"]:
         delta = target["delta_vs_baseline"]
         lines.append(
-            "| {label} | {rows} | {ttft:.2f} | {tbt:.2f} | {tps:.2f} | {d_ttft:+.2f} | {d_tbt:+.2f} | {d_tps:+.2f} |".format(
+            "| {label} | {rows} | {ttft:.2f} | {itl:.2f} | {tpot:.2f} | {e2el:.2f} | {tps:.2f} | {d_ttft:+.2f} | {d_itl:+.2f} | {d_tpot:+.2f} | {d_e2el:+.2f} | {d_tps:+.2f} |".format(
                 label=target["label"],
                 rows=target["rows"],
                 ttft=float(target["avg_ttft_ms"]),
-                tbt=float(target["avg_tbt_ms"]),
+                itl=float(target.get("avg_itl_ms", 0.0)),
+                tpot=float(target.get("avg_tpot_ms", 0.0)),
+                e2el=float(target.get("avg_e2el_ms", 0.0)),
                 tps=float(target["avg_throughput_tps"]),
                 d_ttft=float(delta["ttft_ms"]),
-                d_tbt=float(delta["tbt_ms"]),
+                d_itl=float(delta.get("itl_ms", 0.0)),
+                d_tpot=float(delta.get("tpot_ms", 0.0)),
+                d_e2el=float(delta.get("e2el_ms", 0.0)),
                 d_tps=float(delta["throughput_tps"]),
             )
         )
@@ -634,26 +700,26 @@ def _run_compare_target(
     max_seq_len: int | None,
     max_output_tokens: int | None,
     output_dir: Path,
+    dataset_name: str = "default",
+    num_prompts: int | None = None,
+    input_len: int | None = None,
+    output_len: int | None = None,
 ) -> dict[str, object]:
     """Run a single live compare target and write per-target artifacts."""
-    from sagellm_benchmark.performance.model_benchmarks import (
-        run_e2e_model_benchmarks,
-        summarize_e2e_rows,
-    )
-
-    rows = run_e2e_model_benchmarks(
-        models=[model],
-        batch_sizes=list(batch_sizes),
-        precisions=["live"],
-        simulate=False,
+    rows, summary = run_stream_compare_target(
+        model=model,
         backend_url=url,
+        batch_sizes=batch_sizes,
         api_key=api_key,
         request_timeout=request_timeout,
         server_wait_s=server_wait_s,
-        max_seq_len=max_seq_len,
-        max_output_tokens=max_output_tokens,
+        max_seq_len_override=max_seq_len,
+        max_output_tokens_override=max_output_tokens,
+        dataset_name=dataset_name,
+        num_prompts=num_prompts,
+        input_len=input_len,
+        output_len=output_len,
     )
-    summary = summarize_e2e_rows(rows)
     runtime_artifacts = _capture_target_runtime_artifacts(
         label=label,
         url=url,
@@ -671,6 +737,7 @@ def _run_compare_target(
         "kind": "e2e",
         "simulate": False,
         "mode": "live-compare",
+        "transport": "stream",
         "label": label,
         "url": url,
         "hardware_family": hardware_family,
@@ -1389,12 +1456,25 @@ def _run_compare_command(
     max_output_tokens: int | None,
     output_dir: str | None,
     prompt_cleanup: bool | None,
+    dataset_name: str = "default",
+    num_prompts: int | None = None,
+    input_len: int | None = None,
+    output_len: int | None = None,
     target_commands: dict[str, str] | None = None,
     header: str = "sageLLM Endpoint Compare",
+    command_name: str = "compare",
 ) -> Path:
     """Run a multi-endpoint compare and write artifacts."""
     if len(targets) < 2:
         raise click.BadParameter("Repeat --target at least twice to compare multiple endpoints.")
+
+    _require_dataset_backed_stream_compare_args(
+        dataset_name=dataset_name,
+        num_prompts=num_prompts,
+        input_len=input_len,
+        output_len=output_len,
+        command_name=command_name,
+    )
 
     parsed_targets = [_parse_compare_target(spec) for spec in targets]
     managed_processes = _maybe_start_local_targets(
@@ -1410,6 +1490,7 @@ def _run_compare_command(
     console.print(f"[bold cyan]{header}[/bold cyan]")
     console.print(f"Model: {model}")
     console.print(f"Targets: {len(parsed_targets)}")
+    console.print(f"Dataset: {dataset_name}")
     console.print(f"Output: {compare_output_dir}\n")
 
     target_results: list[dict[str, object]] = []
@@ -1428,6 +1509,10 @@ def _run_compare_command(
             max_seq_len=max_seq_len,
             max_output_tokens=max_output_tokens,
             output_dir=compare_output_dir,
+            dataset_name=dataset_name,
+            num_prompts=num_prompts,
+            input_len=input_len,
+            output_len=output_len,
         )
         target_results.append(target_result)
         summary = target_result["summary"]
@@ -1457,6 +1542,32 @@ def _run_compare_command(
         managed_processes=managed_processes,
     )
     return compare_output_dir
+
+
+def _require_dataset_backed_stream_compare_args(
+    *,
+    dataset_name: str,
+    num_prompts: int | None,
+    input_len: int | None,
+    output_len: int | None,
+    command_name: str,
+) -> None:
+    if dataset_name == "default":
+        return
+
+    missing: list[str] = []
+    if num_prompts is None:
+        missing.append("--num-prompts")
+    if input_len is None:
+        missing.append("--input-len")
+    if output_len is None:
+        missing.append("--output-len")
+
+    if missing:
+        raise click.ClickException(
+            f"{command_name} dataset-backed compare requires {' '.join(missing)}; "
+            "benchmark will not silently use default prompt counts or token lengths"
+        )
 
 
 def _resolve_local_benchmark_root() -> Path | None:
@@ -1700,12 +1811,6 @@ def main() -> None:
     help="Benchmark output directory containing canonical artifacts to publish.",
 )
 @click.option(
-    "--website-dir",
-    type=click.Path(file_okay=False, dir_okay=True),
-    default=None,
-    help="Optional sagellm-website repo root. When set, publish syncs snapshots into <website>/data/.",
-)
-@click.option(
     "--hf-private/--hf-public",
     default=False,
     help="Create the Hugging Face dataset as private/public if it does not exist.",
@@ -1730,7 +1835,6 @@ def main() -> None:
 )
 def publish(
     input_dir: str,
-    website_dir: str | None,
     hf_private: bool,
     hf_token: str | None,
     hf_dataset: str,
@@ -1742,7 +1846,6 @@ def publish(
         publish_hf_dataset=hf_dataset,
         publish_hf_token=hf_token,
         publish_hf_private=hf_private,
-        publish_website_dir=website_dir,
         publish_dry_run=dry_run,
     )
 
@@ -1946,6 +2049,31 @@ def parity_gate_convert_core_telemetry(
     help="Hard cap on output tokens for each request.",
 )
 @click.option(
+    "--dataset-name",
+    type=click.Choice(["default", "random", "sharegpt"]),
+    default="default",
+    show_default=True,
+    help="Prompt source for stream compare. 'default' keeps the built-in short/long scenarios.",
+)
+@click.option(
+    "--num-prompts",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
+    "--input-len",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
+    "--output-len",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
     "--output-dir",
     type=click.Path(),
     default=None,
@@ -1962,9 +2090,15 @@ def compare_record(
     server_wait_s: float,
     max_seq_len: int | None,
     max_output_tokens: int | None,
+    dataset_name: str,
+    num_prompts: int | None,
+    input_len: int | None,
+    output_len: int | None,
     output_dir: str | None,
 ) -> None:
     """Capture one target through the canonical compare pipeline for later offline comparison."""
+    _apply_compare_safe_env_defaults(hardware_family)
+
     _print_compatibility_layer_notice(
         entrypoint="compare-record",
         behavior="the canonical compare target pipeline",
@@ -1979,6 +2113,14 @@ def compare_record(
     console.print(f"Model: {model}")
     console.print(f"Output: {compare_output_dir}\n")
 
+    _require_dataset_backed_stream_compare_args(
+        dataset_name=dataset_name,
+        num_prompts=num_prompts,
+        input_len=input_len,
+        output_len=output_len,
+        command_name="compare-record",
+    )
+
     target_result = _run_compare_target(
         label=label,
         url=url,
@@ -1991,6 +2133,10 @@ def compare_record(
         max_seq_len=max_seq_len,
         max_output_tokens=max_output_tokens,
         output_dir=compare_output_dir,
+        dataset_name=dataset_name,
+        num_prompts=num_prompts,
+        input_len=input_len,
+        output_len=output_len,
     )
     summary = target_result["summary"]
 
@@ -1998,7 +2144,7 @@ def compare_record(
         f"[green]✓[/green] {label}: TTFT={summary['avg_ttft_ms']:.2f}ms, "
         f"TBT={summary['avg_tbt_ms']:.2f}ms, TPS={summary['avg_throughput_tps']:.2f}"
     )
-    _export_compatibility_leaderboard_artifacts(
+    _export_stream_leaderboard_artifacts(
         benchmark_output_dir=compare_output_dir,
         source_command="compare-record",
     )
@@ -2310,7 +2456,10 @@ def compare_offline(results: tuple[str, ...], output_dir: str | None) -> None:
     "--mode",
     type=click.Choice(["batch", "traffic"]),
     default="traffic",
-    help="Benchmark mode: 'batch' for offline throughput (all requests at once), 'traffic' for arrival pattern simulation.",
+    help=(
+        "Benchmark mode: 'batch' for local all-at-once submission, "
+        "'traffic' for arrival pattern simulation."
+    ),
 )
 @click.option(
     "--output-json",
@@ -2351,7 +2500,6 @@ def run(
     publish_hf_dataset: str,
     publish_hf_token: str | None,
     publish_hf_private: bool,
-    publish_website_dir: str | None,
 ) -> None:
     """Run the canonical local workload benchmark pipeline."""
     console.print("[bold cyan]sageLLM Benchmark[/bold cyan]")
@@ -2476,11 +2624,6 @@ def run(
     try:
         results = asyncio.run(runner.run())
         _write_local_run_pipeline_artifacts(output_dir=output_dir, results=results)
-        _export_compatibility_leaderboard_artifacts(
-            benchmark_output_dir=output_dir,
-            source_command="run",
-        )
-
         # Display summary
         console.print("\n[bold green]✓ Benchmark completed![/bold green]\n")
         _display_results(results)
@@ -2517,7 +2660,6 @@ def run(
                 publish_hf_dataset=publish_hf_dataset,
                 publish_hf_token=publish_hf_token,
                 publish_hf_private=publish_hf_private,
-                publish_website_dir=publish_website_dir,
                 publish_dry_run=publish_dry_run,
             )
 
@@ -2563,7 +2705,10 @@ def run(
     "models",
     multiple=True,
     default=("Qwen/Qwen2-7B-Instruct",),
-    help="Model(s) for e2e benchmarks. Repeat for multiple models.",
+    help=(
+        "Model label(s) for e2e benchmarks. Repeat for multiple models in simulate mode; "
+        "use exactly one model in --live mode because perf samples a single endpoint."
+    ),
 )
 @click.option(
     "--batch-size",
@@ -2583,14 +2728,18 @@ def run(
 @click.option(
     "--simulate/--live",
     default=True,
-    help="Run e2e benchmark in deterministic simulation mode (default) or live mode.",
+    help=(
+        "Run e2e benchmark in deterministic simulation mode (default) or live mode. "
+        "Live mode is single-endpoint sampling only; use compare or vllm-compare for "
+        "cross-engine live benchmarks."
+    ),
 )
 @click.option(
     "--backend-url",
     type=str,
     default="http://localhost:8000/v1",
     show_default=True,
-    help="API base URL for live e2e benchmark mode (OpenAI-compatible endpoint).",
+    help="API base URL for single-endpoint live e2e sampling (OpenAI-compatible endpoint).",
 )
 @click.option(
     "--api-key",
@@ -2695,9 +2844,15 @@ def perf(
     theme: str,
     dpi: int,
 ) -> None:
-    """Run performance benchmarks (operator/e2e) migrated from sagellm-core."""
+    """Run single-endpoint performance benchmarks (operator/e2e) migrated from sagellm-core."""
     console.print("[bold cyan]sageLLM Performance Benchmark[/bold cyan]")
     console.print(f"Type: {benchmark_type}")
+
+    if benchmark_type == "e2e" and not simulate and len(models) != 1:
+        raise click.ClickException(
+            "perf --live accepts exactly one --model because it samples a single endpoint. "
+            "Use compare or vllm-compare for cross-engine live benchmarks."
+        )
 
     if benchmark_type == "operator":
         from sagellm_benchmark.performance.benchmark_utils import format_comparison_table
@@ -2732,6 +2887,10 @@ def perf(
             )
             console.print(
                 f"[bold yellow]Mode: live — sending real requests to {backend_url}[/bold yellow]"
+            )
+            console.print(
+                "[dim]Scope: single endpoint operator/e2e collection only; "
+                "use compare or vllm-compare for cross-engine live benchmarks.[/dim]"
             )
             console.print(
                 f"[dim]Models: {', '.join(models)} | "
@@ -2870,6 +3029,31 @@ def perf(
     help="Hard cap on output tokens for each request.",
 )
 @click.option(
+    "--dataset-name",
+    type=click.Choice(["default", "random", "sharegpt"]),
+    default="default",
+    show_default=True,
+    help="Prompt source for stream compare. 'default' keeps the built-in short/long scenarios.",
+)
+@click.option(
+    "--num-prompts",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
+    "--input-len",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
+    "--output-len",
+    type=int,
+    default=None,
+    help="Required when --dataset-name is random or sharegpt.",
+)
+@click.option(
     "--output-dir",
     type=click.Path(),
     default=None,
@@ -2891,6 +3075,10 @@ def compare(
     server_wait_s: float,
     max_seq_len: int | None,
     max_output_tokens: int | None,
+    dataset_name: str,
+    num_prompts: int | None,
+    input_len: int | None,
+    output_len: int | None,
     output_dir: str | None,
     prompt_cleanup: bool | None,
     publish: bool,
@@ -2898,9 +3086,10 @@ def compare(
     publish_hf_dataset: str,
     publish_hf_token: str | None,
     publish_hf_private: bool,
-    publish_website_dir: str | None,
 ) -> None:
-    """Run the canonical live endpoint compare pipeline."""
+    """Run the canonical cross-endpoint live benchmark pipeline."""
+    _apply_compare_safe_env_defaults(hardware_family)
+
     try:
         compare_output_dir = _run_compare_command(
             targets=targets,
@@ -2913,13 +3102,18 @@ def compare(
             server_wait_s=server_wait_s,
             max_seq_len=max_seq_len,
             max_output_tokens=max_output_tokens,
+            dataset_name=dataset_name,
+            num_prompts=num_prompts,
+            input_len=input_len,
+            output_len=output_len,
             output_dir=output_dir,
             prompt_cleanup=prompt_cleanup,
+            command_name="compare",
         )
     except click.ClickException as exc:
         raise click.ClickException(f"benchmark failure: {exc.format_message()}") from exc
 
-    _export_compatibility_leaderboard_artifacts(
+    _prepare_compare_publish_ready_outputs(
         benchmark_output_dir=compare_output_dir,
         source_command="compare",
     )
@@ -2930,14 +3124,13 @@ def compare(
             publish_hf_dataset=publish_hf_dataset,
             publish_hf_token=publish_hf_token,
             publish_hf_private=publish_hf_private,
-            publish_website_dir=publish_website_dir,
             publish_dry_run=publish_dry_run,
         )
 
 
 @main.group("vllm-compare")
 def vllm_compare() -> None:
-    """Convenience wrappers for the canonical compare pipeline and its validated vLLM setup."""
+    """Validated vLLM environment helpers for the canonical compare pipeline."""
     pass
 
 
@@ -2990,172 +3183,6 @@ def vllm_compare_install_ascend(python_bin: str, sagellm_root: str) -> None:
     )
 
     console.print("\n[bold green]✓ vLLM Ascend compare environment is ready[/bold green]")
-
-
-@_add_publish_options
-@vllm_compare.command("run")
-@click.option(
-    "--vllm-url",
-    envvar="VLLM_COMPARE_VLLM_URL",
-    default="http://127.0.0.1:8000/v1",
-    show_default=True,
-    help="vLLM OpenAI-compatible endpoint URL.",
-)
-@click.option(
-    "--start-vllm-cmd",
-    type=str,
-    default=None,
-    help="Optional local command to start the vLLM endpoint when it is not already running.",
-)
-@click.option(
-    "--sagellm-url",
-    envvar="VLLM_COMPARE_SAGELLM_URL",
-    default="http://127.0.0.1:8901/v1",
-    show_default=True,
-    help="sageLLM OpenAI-compatible endpoint URL.",
-)
-@click.option(
-    "--start-sagellm-cmd",
-    type=str,
-    default=None,
-    help="Optional local command to start the sageLLM endpoint when it is not already running.",
-)
-@click.option(
-    "--model",
-    type=str,
-    default="Qwen/Qwen2.5-0.5B-Instruct",
-    show_default=True,
-    help="Requested model name for the benchmark run.",
-)
-@click.option(
-    "--hardware-family",
-    required=True,
-    help="Hardware family shared by sageLLM and vLLM for this compare run, e.g. cuda or ascend.",
-)
-@click.option(
-    "--batch-size",
-    "batch_sizes",
-    multiple=True,
-    type=int,
-    default=(1, 2, 4),
-    show_default=True,
-    help="Batch sizes to benchmark. Repeat for multiple values.",
-)
-@click.option(
-    "--api-key",
-    type=str,
-    default="sagellm-benchmark",
-    show_default=True,
-    help="API key used for both endpoints.",
-)
-@click.option(
-    "--request-timeout",
-    type=float,
-    default=120.0,
-    show_default=True,
-    help="Per-request timeout in seconds.",
-)
-@click.option(
-    "--server-wait",
-    "server_wait_s",
-    type=float,
-    default=30.0,
-    show_default=True,
-    help="Max seconds to wait for each endpoint to become ready.",
-)
-@click.option(
-    "--max-seq-len",
-    type=int,
-    default=None,
-    help="Override the detected maximum sequence length for both endpoints.",
-)
-@click.option(
-    "--max-output-tokens",
-    type=int,
-    default=64,
-    show_default=True,
-    help="Hard cap on output tokens for each request.",
-)
-@click.option(
-    "--output-dir",
-    type=click.Path(),
-    default=None,
-    help="Directory to save compare artifacts (default: benchmark_results/compare_<timestamp>).",
-)
-@click.option(
-    "--prompt-cleanup/--no-prompt-cleanup",
-    default=None,
-    help="Prompt to terminate local target processes after compare completes. Defaults to on in interactive terminals only.",
-)
-def vllm_compare_run(
-    vllm_url: str,
-    start_vllm_cmd: str | None,
-    sagellm_url: str,
-    start_sagellm_cmd: str | None,
-    model: str,
-    hardware_family: str,
-    batch_sizes: tuple[int, ...],
-    api_key: str,
-    request_timeout: float,
-    server_wait_s: float,
-    max_seq_len: int | None,
-    max_output_tokens: int,
-    output_dir: str | None,
-    prompt_cleanup: bool | None,
-    publish: bool,
-    publish_dry_run: bool,
-    publish_hf_dataset: str,
-    publish_hf_token: str | None,
-    publish_hf_private: bool,
-    publish_website_dir: str | None,
-) -> None:
-    """Run the standard sageLLM vs vLLM compare flow as a thin wrapper over compare."""
-    _print_compatibility_layer_notice(
-        entrypoint="vllm-compare run",
-        behavior="sagellm-benchmark compare with standard sagellm/vllm labels and env defaults",
-        recommended_path="sagellm-benchmark compare",
-    )
-    _apply_vllm_compare_safe_env_defaults(hardware_family)
-    try:
-        compare_output_dir = _run_compare_command(
-            targets=(f"sagellm={sagellm_url}", f"vllm={vllm_url}"),
-            target_commands={
-                key: value
-                for key, value in {
-                    "sagellm": start_sagellm_cmd,
-                    "vllm": start_vllm_cmd,
-                }.items()
-                if value
-            },
-            model=model,
-            hardware_family=hardware_family,
-            batch_sizes=batch_sizes,
-            api_key=api_key,
-            request_timeout=request_timeout,
-            server_wait_s=server_wait_s,
-            max_seq_len=max_seq_len,
-            max_output_tokens=max_output_tokens,
-            output_dir=output_dir,
-            prompt_cleanup=prompt_cleanup,
-            header="sageLLM vs vLLM Compare",
-        )
-    except click.ClickException as exc:
-        raise click.ClickException(f"benchmark failure: {exc.format_message()}") from exc
-
-    _export_compatibility_leaderboard_artifacts(
-        benchmark_output_dir=compare_output_dir,
-        source_command="vllm-compare run",
-    )
-
-    if publish:
-        _run_publish_workflow(
-            benchmark_output_dir=compare_output_dir,
-            publish_hf_dataset=publish_hf_dataset,
-            publish_hf_token=publish_hf_token,
-            publish_hf_private=publish_hf_private,
-            publish_website_dir=publish_website_dir,
-            publish_dry_run=publish_dry_run,
-        )
 
 
 @main.command()
@@ -3689,221 +3716,19 @@ def upload_hf(
     private: bool,
     dry_run: bool,
 ) -> None:
-    """Upload benchmark leaderboard files to Hugging Face dataset."""
+    """Compatibility alias for the standard publish upload workflow."""
     _print_compatibility_layer_notice(
         entrypoint="upload-hf",
-        behavior="the canonical publish/export boundary over derived leaderboard artifacts",
-        recommended_path="sagellm-benchmark run --publish or sagellm-benchmark compare --publish",
+        behavior="the publish mainline",
+        recommended_path="publish --input <dir>",
     )
-    hf_api_cls = None
-    hf_hub_download = None
-    if not dry_run:
-        try:
-            from huggingface_hub import HfApi, hf_hub_download
-
-            hf_api_cls = HfApi
-        except ImportError:
-            console.print("[red]❌ missing dependency: huggingface_hub[/red]")
-            console.print("Install with: [cyan]pip install huggingface_hub[/cyan]")
-            sys.exit(1)
-
-    resolved_token = token or os.getenv("HF_TOKEN")
-    if not resolved_token and not dry_run:
-        console.print("[red]❌ HF token not provided[/red]")
-        console.print("Use --token or set HF_TOKEN environment variable")
-        sys.exit(1)
-
-    hf_endpoint = os.getenv("HF_ENDPOINT", "https://huggingface.co")
-    os.environ["HF_ENDPOINT"] = hf_endpoint
-
-    input_path = Path(input_dir)
-    collected_entries, parse_errors = LeaderboardExporter.collect_entries_from_directory(input_path)
-
-    if parse_errors:
-        console.print("[red]❌ Invalid standard leaderboard exports detected:[/red]")
-        for error in parse_errors:
-            console.print(f"  - {error}")
-        sys.exit(1)
-
-    if not collected_entries:
-        console.print(f"[red]❌ No standard leaderboard exports found under: {input_path}[/red]")
-        sys.exit(1)
-
-    console.print(f"[cyan]Endpoint:[/cyan] {hf_endpoint}")
-    console.print(f"[cyan]Scanning[/cyan] {len(collected_entries)} entries from {input_path}")
-
-    canonical_entries: dict[str, dict] = {}
-    for entry in collected_entries:
-        entry_with_key = LeaderboardExporter.annotate_entry_identity(entry)
-        key = build_idempotency_key(entry_with_key)
-        existing = canonical_entries.get(key)
-        canonical_entries[key] = (
-            _prefer_newer_entry(existing, entry_with_key) if existing else entry_with_key
-        )
-
-    if not canonical_entries:
-        console.print("[red]❌ No valid leaderboard entries found for upload[/red]")
-        sys.exit(1)
-
-    console.print(
-        f"[cyan]Idempotent entries:[/cyan] {len(canonical_entries)} "
-        f"(from {len(collected_entries)} source entries)"
+    _run_publish_workflow(
+        benchmark_output_dir=Path(input_dir),
+        publish_hf_dataset=dataset,
+        publish_hf_token=token,
+        publish_hf_private=private,
+        publish_dry_run=dry_run,
     )
-
-    remote_entries: list[dict] = []
-    api = None
-    if not dry_run:
-        api = hf_api_cls(endpoint=hf_endpoint, token=resolved_token)
-
-        try:
-            api.repo_info(repo_id=dataset, repo_type="dataset")
-            console.print(f"[green]✓ Dataset exists:[/green] {dataset}")
-        except Exception:
-            console.print(f"[yellow]⚠ Dataset not found, creating:[/yellow] {dataset}")
-            api.create_repo(repo_id=dataset, repo_type="dataset", private=private)
-            console.print(f"[green]✓ Created dataset:[/green] {dataset}")
-
-        for snapshot_name in (HF_SNAPSHOT_FILES["single"], HF_SNAPSHOT_FILES["multi"]):
-            try:
-                remote_file = hf_hub_download(
-                    repo_id=dataset,
-                    filename=snapshot_name,
-                    repo_type="dataset",
-                    token=resolved_token,
-                    endpoint=hf_endpoint,
-                )
-            except Exception:
-                continue
-
-            with open(remote_file, encoding="utf-8") as f:
-                remote_payload = json.load(f)
-
-            if not isinstance(remote_payload, list):
-                console.print(f"[red]❌ Remote snapshot {snapshot_name} is not a JSON array[/red]")
-                sys.exit(1)
-
-            try:
-                for index, entry in enumerate(remote_payload):
-                    remote_entries.append(
-                        LeaderboardExporter.validate_leaderboard_entry(
-                            entry,
-                            label=f"remote snapshot {snapshot_name}[{index}]",
-                        )
-                    )
-            except ValueError as exc:
-                console.print(f"[red]❌ Remote snapshot validation failed:[/red] {exc}")
-                sys.exit(1)
-
-    merged_entries = list(remote_entries)
-    merged_entries.extend(canonical_entries.values())
-    snapshots = LeaderboardExporter.build_snapshot_payloads(merged_entries)
-    marker_payload = {"last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}
-
-    if dry_run:
-        console.print("[bold green]✅ Dry-run validation passed[/bold green]")
-        console.print(
-            f"Would upload {len(canonical_entries)} canonical entries and refresh "
-            f"{HF_SNAPSHOT_FILES['single']} ({len(snapshots['single'])} entries), "
-            f"{HF_SNAPSHOT_FILES['multi']} ({len(snapshots['multi'])} entries), and "
-            f"{HF_SNAPSHOT_FILES['marker']}."
-        )
-        return
-
-    upload_errors: list[str] = []
-    skipped_count = 0
-    uploaded_count = 0
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Uploading canonical entries", total=len(canonical_entries))
-
-        for key, entry in canonical_entries.items():
-            path_in_repo = entry["canonical_path"]
-            try:
-                local_is_newer = True
-                try:
-                    remote_file = hf_hub_download(
-                        repo_id=dataset,
-                        filename=path_in_repo,
-                        repo_type="dataset",
-                        token=resolved_token,
-                        endpoint=hf_endpoint,
-                    )
-                    with open(remote_file) as f:
-                        remote_payload = json.load(f)
-                    remote_entries = _normalize_entries_payload(remote_payload)
-                    if remote_entries:
-                        preferred = _prefer_newer_entry(remote_entries[0], entry)
-                        local_is_newer = preferred is entry
-                except Exception:
-                    local_is_newer = True
-
-                if not local_is_newer:
-                    skipped_count += 1
-                    continue
-
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".json", encoding="utf-8", delete=False
-                ) as temp_file:
-                    json.dump(entry, temp_file, indent=2)
-                    temp_path = temp_file.name
-
-                api.upload_file(
-                    path_or_fileobj=temp_path,
-                    path_in_repo=path_in_repo,
-                    repo_id=dataset,
-                    repo_type="dataset",
-                    commit_message=(
-                        f"Upsert canonical leaderboard {path_in_repo} "
-                        f"({datetime.now().isoformat()})"
-                    ),
-                )
-                uploaded_count += 1
-                Path(temp_path).unlink(missing_ok=True)
-            except Exception as exc:  # pragma: no cover - network/runtime dependent
-                upload_errors.append(f"{path_in_repo}: {exc}")
-            finally:
-                progress.advance(task)
-
-    for snapshot_name, payload in (
-        (HF_SNAPSHOT_FILES["single"], snapshots["single"]),
-        (HF_SNAPSHOT_FILES["multi"], snapshots["multi"]),
-        (HF_SNAPSHOT_FILES["marker"], marker_payload),
-    ):
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", encoding="utf-8", delete=False
-            ) as temp_file:
-                json.dump(payload, temp_file, indent=2)
-                temp_path = temp_file.name
-
-            api.upload_file(
-                path_or_fileobj=temp_path,
-                path_in_repo=snapshot_name,
-                repo_id=dataset,
-                repo_type="dataset",
-                commit_message=(
-                    f"Update HF leaderboard snapshot {snapshot_name} ({datetime.now().isoformat()})"
-                ),
-            )
-            Path(temp_path).unlink(missing_ok=True)
-        except Exception as exc:  # pragma: no cover - network/runtime dependent
-            upload_errors.append(f"{snapshot_name}: {exc}")
-
-    if upload_errors:
-        console.print("[red]❌ Upload completed with errors:[/red]")
-        for error in upload_errors:
-            console.print(f"  - {error}")
-        sys.exit(1)
-
-    console.print("[bold green]✅ Upload complete![/bold green]")
-    console.print(f"[green]Uploaded:[/green] {uploaded_count}")
-    console.print(f"[yellow]Skipped (remote newer/same):[/yellow] {skipped_count}")
-    console.print(f"🔗 https://huggingface.co/datasets/{dataset}")
 
 
 @main.command()

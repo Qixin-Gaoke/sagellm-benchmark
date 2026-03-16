@@ -345,38 +345,44 @@ async def test_gateway_client_counts_real_tokens_not_stream_chunks(monkeypatch) 
             del add_special_tokens
             return [index for index, char in enumerate(text) if not char.isspace()]
 
-    class _FakeChunk:
-        def __init__(self, content: str) -> None:
-            self.choices = [SimpleNamespace(delta=SimpleNamespace(content=content))]
+    class _FakeResponse:
+        status_code = 200
 
-    class _FakeStream:
-        def __init__(self, chunks: list[str]) -> None:
-            self._chunks = chunks
-            self._index = 0
+        def __init__(self) -> None:
+            self._chunks = [
+                b'data: {"choices":[{"delta":{"content":"He"}}]}\n\n',
+                b'data: {"choices":[{"delta":{"content":"llo"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ]
 
-        def __aiter__(self):
-            return self
+        async def aiter_bytes(self):
+            for chunk in self._chunks:
+                yield chunk
 
-        async def __anext__(self):
-            if self._index >= len(self._chunks):
-                raise StopAsyncIteration
-            chunk = _FakeChunk(self._chunks[self._index])
-            self._index += 1
-            return chunk
+        async def aread(self) -> bytes:
+            return b""
 
-    class _FakeCompletions:
-        async def create(self, **kwargs):
-            del kwargs
-            return _FakeStream(["He", "llo"])
+    class _FakeStreamContext:
+        async def __aenter__(self):
+            return _FakeResponse()
 
-    class _FakeAsyncOpenAI:
-        def __init__(self, **kwargs) -> None:
-            del kwargs
-            self.chat = SimpleNamespace(completions=_FakeCompletions())
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    class _FakeHTTPClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            return _FakeStreamContext()
+
+        async def aclose(self) -> None:
+            return None
 
     perf_times = iter([10.0, 10.05, 10.08, 10.10])
 
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=_FakeAsyncOpenAI))
     monkeypatch.setitem(
         sys.modules,
         "transformers",
@@ -384,12 +390,13 @@ async def test_gateway_client_counts_real_tokens_not_stream_chunks(monkeypatch) 
             AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: _FakeTokenizer())
         ),
     )
-    monkeypatch.setattr(
-        "sagellm_benchmark.clients.openai_client.time.perf_counter",
-        lambda: next(perf_times),
-    )
 
-    client = GatewayClient(base_url="http://127.0.0.1:8000/v1")
+    http_client = _FakeHTTPClient()
+    client = GatewayClient(
+        base_url="http://127.0.0.1:8000/v1",
+        http_client=http_client,
+        time_fn=lambda: next(perf_times),
+    )
     request = BenchmarkRequest(
         prompt="Hi all",
         max_tokens=8,
@@ -403,11 +410,87 @@ async def test_gateway_client_counts_real_tokens_not_stream_chunks(monkeypatch) 
     assert result.output_text == "Hello"
     assert result.output_tokens == 5
     assert result.prompt_tokens == 5
+    assert result.itl_list == pytest.approx([30.0])
+    assert result.e2e_latency_ms == pytest.approx(100.0)
     assert result.metrics is not None
     assert result.metrics.ttft_ms == pytest.approx(50.0)
-    assert result.metrics.tbt_ms == pytest.approx(12.5)
-    assert result.metrics.tpot_ms == pytest.approx(20.0)
+    assert result.metrics.tbt_ms == pytest.approx(30.0)
+    assert result.metrics.tpot_ms == pytest.approx(12.5)
     assert result.metrics.throughput_tps == pytest.approx(50.0)
+    assert http_client.calls[0]["json"] == {
+        "model": "/tmp/local-model",
+        "max_tokens": 8,
+        "stream": True,
+        "messages": [{"role": "user", "content": "Hi all"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_does_not_forward_optional_sampling_fields(monkeypatch) -> None:
+    class _FakeResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        async def aread(self) -> bytes:
+            return b""
+
+    class _FakeStreamContext:
+        async def __aenter__(self):
+            return _FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    class _FakeHTTPClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            return _FakeStreamContext()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: None)
+        ),
+    )
+
+    http_client = _FakeHTTPClient()
+    client = GatewayClient(
+        base_url="http://127.0.0.1:8000/v1",
+        http_client=http_client,
+        time_fn=iter([20.0, 20.04, 20.08]).__next__,
+    )
+
+    result = await client.generate(
+        BenchmarkRequest(
+            prompt="sample prompt",
+            max_tokens=6,
+            request_id="gateway-optional-001",
+            model="sample-model",
+            temperature=0.7,
+            top_p=0.9,
+        )
+    )
+
+    assert result.success is True
+    assert http_client.calls[0]["json"] == {
+        "model": "sample-model",
+        "max_tokens": 6,
+        "stream": True,
+        "messages": [{"role": "user", "content": "sample prompt"}],
+    }
+    assert "temperature" not in http_client.calls[0]["json"]
+    assert "top_p" not in http_client.calls[0]["json"]
 
 
 def test_gateway_client_prefers_explicit_local_model_dir(monkeypatch: pytest.MonkeyPatch) -> None:

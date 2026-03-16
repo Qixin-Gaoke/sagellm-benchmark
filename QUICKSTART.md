@@ -37,13 +37,40 @@ sagellm-benchmark vllm-compare install-ascend
 
 完整流程见 [docs/ASCEND_BENCHMARK.md](docs/ASCEND_BENCHMARK.md)。
 
-标准 `sageLLM vs vLLM` live 对比便利入口：
+标准 `sageLLM vs vLLM` live 对比主入口：
 
 ```bash
-sagellm-benchmark vllm-compare run \
-  --sagellm-url http://127.0.0.1:8901/v1 \
-  --vllm-url http://127.0.0.1:8000/v1 \
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --hardware-family cuda \
   --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+这里的边界需要明确：`compare` 是唯一推荐的跨引擎 live benchmark 主入口；`vllm-compare` 现在只保留 `install-ascend` 这类环境辅助命令，不再保留第二个 live compare wrapper。
+
+不加 `--publish` 时，这条命令也会直接产出稳定可发布目录：`<output-dir>/publish/website-ready/`。里面固定包含 `leaderboard_single.json`、`leaderboard_multi.json`、`leaderboard_compare.json` 和 `last_updated.json`，后续 `publish` 与 website 离线同步都复用这条边界。
+
+一键发布主链示例：
+
+```bash
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --hardware-family cuda \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --publish \
+  --publish-hf-dataset intellistream/sagellm-benchmark-results
+```
+
+该命令成功后会先在本地 compare 输出目录下统一刷新 `leaderboard_single.json`、`leaderboard_multi.json`、`leaderboard_compare.json` 和 `last_updated.json`，然后再把同一批标准派生工件上传到 HF dataset。website 同步不是 publish 的职责；website 只消费这些标准派生工件，不再手工改 JSON。
+
+如果目录已经是标准 compare 导出结果，也可以直接复用 publish 主链：
+
+```bash
+sagellm-benchmark publish \
+  --input ./benchmark_results/compare \
+  --hf-dataset intellistream/sagellm-benchmark-results
 ```
 
 对于 A100/CUDA 主机，推荐把 vLLM 固定放进 Docker 容器里运行，避免宿主机每次重复拉取 wheel、重配 torch ABI、或在冷启动时因为本地环境漂移导致失败：
@@ -52,21 +79,24 @@ sagellm-benchmark vllm-compare run \
 cd sagellm-benchmark
 VLLM_GPU_DEVICE=1 VLLM_PORT=9100 ./scripts/start_vllm_cuda_docker.sh
 
-sagellm-benchmark vllm-compare run \
-  --sagellm-url http://127.0.0.1:8901/v1 \
-  --vllm-url http://127.0.0.1:9100/v1 \
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:9100/v1 \
+  --hardware-family cuda \
   --model Qwen/Qwen2.5-1.5B-Instruct
 
 # Sequential mode for single-GPU or tight-memory validation
 sagellm-benchmark compare-record \
   --label sagellm \
   --url http://127.0.0.1:8901/v1 \
+  --hardware-family cuda \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --output-dir ./benchmark_results/sequential/sagellm
 
 sagellm-benchmark compare-record \
   --label vllm \
   --url http://127.0.0.1:9100/v1 \
+  --hardware-family cuda \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --output-dir ./benchmark_results/sequential/vllm
 
@@ -79,10 +109,11 @@ sagellm-benchmark compare-offline \
 如需在 endpoint 缺失时由 benchmark 自动拉起 Dockerized vLLM：
 
 ```bash
-sagellm-benchmark vllm-compare run \
-  --sagellm-url http://127.0.0.1:8901/v1 \
-  --vllm-url http://127.0.0.1:9100/v1 \
-  --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:9100/v1 \
+  --target-command "vllm=./scripts/start_vllm_cuda_docker.sh" \
+  --hardware-family cuda \
   --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
@@ -151,6 +182,75 @@ sagellm-benchmark compare \
   --hardware-family cuda
 ```
 
+### Option 4: Dataset-Backed Streaming Serving Benchmark
+
+```bash
+# Synthetic random prompts through the canonical stream compare path
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --hardware-family cuda \
+  --dataset-name random \
+  --num-prompts 128 \
+  --input-len 512 \
+  --output-len 128
+
+# ShareGPT-backed prompts on the same canonical compare transport
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --hardware-family cuda \
+  --dataset-name sharegpt \
+  --num-prompts 64 \
+  --input-len 1024 \
+  --output-len 256
+```
+
+这条主线走的是 OpenAI-compatible `/v1/chat/completions` + `stream=true`。结果里会聚合 TTFT、ITL、TPOT、E2EL、request throughput、input throughput 和 output throughput。
+
+`/v1/completions` 配合 `stream=true` 不在 benchmark 支持边界内。benchmark 侧会直接 fail-fast，只接受 `/v1/chat/completions` 的 streaming serving benchmark。
+
+参数语义：
+
+- `--dataset-name default` 继续使用内建 short/long serving scenarios。
+- `--dataset-name random|sharegpt` 会切换到 dataset 驱动压测。
+- dataset 模式下必须同时提供 `--num-prompts`、`--input-len`、`--output-len`。
+
+### Option 5: Sequential Capture Then Offline Compare
+
+```bash
+sagellm-benchmark compare-record \
+  --label sagellm \
+  --url http://127.0.0.1:8901/v1 \
+  --hardware-family cuda \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset-name sharegpt \
+  --num-prompts 64 \
+  --input-len 1024 \
+  --output-len 256 \
+  --output-dir ./benchmark_results/sequential/sagellm
+
+sagellm-benchmark compare-record \
+  --label vllm \
+  --url http://127.0.0.1:8000/v1 \
+  --hardware-family cuda \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset-name sharegpt \
+  --num-prompts 64 \
+  --input-len 1024 \
+  --output-len 256 \
+  --output-dir ./benchmark_results/sequential/vllm
+
+sagellm-benchmark compare-offline \
+  --result sagellm=./benchmark_results/sequential/sagellm/sagellm.json \
+  --result vllm=./benchmark_results/sequential/vllm/vllm.json \
+  --output-dir ./benchmark_results/sequential/compare
+```
+
+当两套服务不能同时常驻，或者同机显存不够时，这条路径最稳。`compare-record` 仍然复用 canonical compare target pipeline，只是把在线比较拆成顺序采集。
+
 ## What Gets Generated?
 
 After running, you'll have:
@@ -167,6 +267,36 @@ benchmark_results/
 ├── leaderboard_manifest.json    # Compatibility export boundary
 └── REPORT.md                    # Human-readable report
 ```
+
+对于 `compare`，标准输出目录会稳定成：
+
+```text
+benchmark_results/compare_YYYYMMDD_HHMMSS/
+├── sagellm.json
+├── sagellm.md
+├── sagellm.canonical.json
+├── sagellm.parity.json
+├── sagellm_leaderboard.json
+├── sagellm_info.json            # 如果 /info 可用
+├── sagellm_core_telemetry.json  # 如果显式 decode telemetry 可用
+├── vllm.json
+├── vllm.md
+├── vllm.canonical.json
+├── vllm.parity.json
+├── vllm_leaderboard.json
+├── comparison.json
+├── comparison.md
+├── comparison.canonical.json
+├── leaderboard_manifest.json
+└── publish/
+  └── website-ready/
+    ├── leaderboard_single.json
+    ├── leaderboard_multi.json
+    ├── leaderboard_compare.json
+    └── last_updated.json
+```
+
+也就是说，`compare` 完成后已经直接具备 publish 输入边界；`--publish` 只是在这套工件上继续执行上传和同步。
 
 Convergence profile outputs look like:
 
@@ -290,6 +420,46 @@ sagellm-benchmark report --format markdown > REPORT.md
 sagellm-benchmark report --format json
 ```
 
+## Traffic Shaping
+
+`request_rate`、`burstiness`、`ramp_up` 目前已经是 benchmark 的 traffic API 能力，但还不是 `compare` 的 CLI 参数。因此推荐做法是：跨引擎对比仍然用 `compare` 产出标准工件；如果你要做更细的 arrival shaping，就在自定义 harness 中复用 benchmark 的 traffic 模块。
+
+```python
+from sagellm_benchmark import ArrivalPattern, RampUpStrategy, TrafficProfile
+from sagellm_benchmark.datasets.serving import build_serving_requests
+from sagellm_benchmark.traffic import RequestGenerator
+
+requests = build_serving_requests(
+  dataset_name="random",
+  num_prompts=128,
+  input_len=512,
+  output_len=128,
+  model="Qwen/Qwen2.5-0.5B-Instruct",
+  stream=True,
+)
+
+profile = TrafficProfile(
+  pattern=ArrivalPattern.GAMMA,
+  request_rate=12.0,
+  burstiness=0.5,
+  ramp_up_strategy=RampUpStrategy.EXPONENTIAL,
+  ramp_up_requests=24,
+  ramp_up_start_factor=0.2,
+  num_prompts=128,
+  seed=42,
+)
+
+generator = RequestGenerator(requests, profile)
+```
+
+这些参数的含义：
+
+- `request_rate`: 目标请求速率，单位 req/s；`inf`、`0`、`None` 都会归一化成不限速。
+- `burstiness`: Gamma shape 参数，`1.0` 接近泊松，越小越突发，越大越均匀。
+- `ramp_up_strategy`: 当前支持 `linear` 和 `exponential`。
+- `ramp_up_requests`: 前多少个请求参与爬升。
+- `ramp_up_start_factor`: 起始速率占目标速率的比例。
+
 Ascend-first startup example for a candidate endpoint:
 
 ```bash
@@ -339,6 +509,8 @@ sagellm-benchmark run --workload all --backend cpu --mode batch
 # Traffic mode - comparable to SGLang's serving benchmark
 sagellm-benchmark run --workload all --backend cpu --mode traffic
 ```
+
+做真实跨引擎 live endpoint 对比时，统一使用 `sagellm-benchmark compare`。
 
 **Output includes vLLM/SGLang compatible metrics:**
 - Request Throughput (req/s)

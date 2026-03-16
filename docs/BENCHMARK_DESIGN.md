@@ -19,7 +19,7 @@ Benchmark outputs are now **canonical-first**:
 |---|---|---|---|
 | `sagellm-benchmark run` | Canonical local workload benchmark pipeline | Mainline | Produces local workload `execution_result` canonical artifacts. |
 | `sagellm-benchmark compare` | Canonical live multi-endpoint benchmark pipeline | Mainline | Produces one canonical `execution_result` per target plus one canonical comparison summary. |
-| `sagellm-benchmark vllm-compare run` | Semantic convenience wrapper for standard `sageLLM vs vLLM` compare | Convenience layer | Reuses `compare`; it is not a separate benchmark pipeline. |
+| `sagellm-benchmark vllm-compare install-ascend` | Validated Ascend compare environment setup | Setup helper | Does not define a benchmark execution path. |
 | `./run_benchmark.sh --profile quick` | Shell convenience wrapper for local default run | Compatibility layer | Reuses `sagellm-benchmark run`; retained for scripting/backward compatibility. |
 | `./run_benchmark.sh --profile convergence` | Shell convenience wrapper for compare plus extra probes | Compatibility layer | Reuses `sagellm-benchmark compare` and adds `/info`/`/metrics`/log probes plus validation packaging. |
 | `sagellm-benchmark compare-record` | Single-target capture helper for constrained environments | Compatibility layer | Reuses the canonical compare target pipeline; useful when endpoints cannot coexist. |
@@ -32,7 +32,7 @@ Only two benchmark execution paths are recommended:
 1. `sagellm-benchmark run` for local workload benchmarks.
 2. `sagellm-benchmark compare` for live endpoint comparison.
 
-Use `sagellm-benchmark vllm-compare run` only when the goal is the standard `sageLLM vs vLLM` workflow and the semantic wrapper improves operability. Use `run_benchmark.sh` only when an existing shell workflow depends on it.
+Use `sagellm-benchmark vllm-compare install-ascend` only for validated Ascend environment bring-up. Use `run_benchmark.sh` only when an existing shell workflow depends on it.
 
 ## 4. Canonical-First Pipeline
 
@@ -62,7 +62,6 @@ Publish is explicit:
 
 - `run --publish`
 - `compare --publish`
-- `vllm-compare run --publish`
 
 Publish first regenerates the compatibility export boundary from canonical artifacts, then uploads canonical per-entry files plus website-facing HF snapshots.
 
@@ -120,12 +119,8 @@ sagellm-benchmark compare \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --hardware-family cuda
 
-# Standard semantic wrapper for sageLLM vs vLLM
-sagellm-benchmark vllm-compare run \
-  --sagellm-url http://127.0.0.1:8901/v1 \
-  --vllm-url http://127.0.0.1:8000/v1 \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --hardware-family ascend
+# Validated Ascend compare environment setup
+sagellm-benchmark vllm-compare install-ascend
 ```
 
 ### Compatibility wrappers

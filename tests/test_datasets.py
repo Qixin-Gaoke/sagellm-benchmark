@@ -18,12 +18,14 @@ from sagellm_benchmark.datasets import (
     BenchmarkDataset,
     RandomDataset,
     SyntheticShareGPTDataset,
+    build_serving_requests,
     create_custom_workload,
     get_workload_by_type,
     get_workloads_by_year,
     get_year1_workloads,
     get_year2_workloads,
     get_year3_workloads,
+    load_serving_dataset,
 )
 from sagellm_benchmark.types import BenchmarkRequest, WorkloadSpec, WorkloadType
 
@@ -269,6 +271,115 @@ class TestSyntheticShareGPTDataset:
         """测试数据集名称。"""
         dataset = SyntheticShareGPTDataset()
         assert dataset.name == "synthetic_sharegpt"
+
+
+class TestServingDatasetHelpers:
+    """Serving benchmark dataset helper 测试。"""
+
+    def test_load_serving_dataset_random(self) -> None:
+        dataset = load_serving_dataset("random", seed=7)
+        assert isinstance(dataset, RandomDataset)
+        assert dataset.name == "random"
+
+    def test_load_serving_dataset_invalid_name(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported serving dataset"):
+            load_serving_dataset("unknown")
+
+    def test_build_serving_requests_random_is_reproducible(self) -> None:
+        requests1 = build_serving_requests(
+            dataset_name="random",
+            num_prompts=3,
+            input_len=64,
+            output_len=16,
+            model="demo-model",
+            stream=True,
+            seed=42,
+        )
+        requests2 = build_serving_requests(
+            dataset_name="random",
+            num_prompts=3,
+            input_len=64,
+            output_len=16,
+            model="demo-model",
+            stream=True,
+            seed=42,
+        )
+
+        assert [request.prompt for request in requests1] == [
+            request.prompt for request in requests2
+        ]
+        assert [request.request_id for request in requests1] == ["random-0", "random-1", "random-2"]
+        assert all(request.stream for request in requests1)
+        assert all(request.model == "demo-model" for request in requests1)
+        assert all(request.max_tokens == 16 for request in requests1)
+
+    def test_build_serving_requests_sharegpt_uses_existing_loader(self, monkeypatch) -> None:
+        sample_data = [
+            {
+                "conversations": [
+                    {"from": "human", "value": "Explain tensor parallelism in two paragraphs."},
+                    {"from": "gpt", "value": "Tensor parallelism splits tensors across devices."},
+                ]
+            },
+            {
+                "conversations": [
+                    {"from": "human", "value": "Describe continuous batching for LLM serving."},
+                    {"from": "gpt", "value": "Continuous batching keeps the decode queue full."},
+                ]
+            },
+        ]
+
+        def fake_from_huggingface(**kwargs):
+            return __import__(
+                "sagellm_benchmark.datasets.sharegpt",
+                fromlist=["ShareGPTDataset"],
+            ).ShareGPTDataset(sample_data, seed=kwargs.get("seed"))
+
+        monkeypatch.setattr(
+            "sagellm_benchmark.datasets.serving.ShareGPTDataset.from_huggingface",
+            fake_from_huggingface,
+        )
+
+        requests = build_serving_requests(
+            dataset_name="sharegpt",
+            num_prompts=2,
+            input_len=8,
+            output_len=24,
+            model="sharegpt-model",
+            stream=False,
+            seed=11,
+        )
+
+        assert len(requests) == 2
+        assert [request.request_id for request in requests] == ["sharegpt-0", "sharegpt-1"]
+        assert all(request.model == "sharegpt-model" for request in requests)
+        assert all(request.stream is False for request in requests)
+        assert all(request.max_tokens == 24 for request in requests)
+
+    @pytest.mark.parametrize(
+        ("num_prompts", "input_len", "output_len", "message"),
+        [
+            (0, 64, 16, "num_prompts"),
+            (2, 0, 16, "input_len"),
+            (2, 64, 0, "output_len"),
+        ],
+    )
+    def test_build_serving_requests_rejects_invalid_lengths(
+        self,
+        num_prompts: int,
+        input_len: int,
+        output_len: int,
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            build_serving_requests(
+                dataset_name="random",
+                num_prompts=num_prompts,
+                input_len=input_len,
+                output_len=output_len,
+                model="demo-model",
+                stream=True,
+            )
 
 
 class TestYearDemoWorkloads:

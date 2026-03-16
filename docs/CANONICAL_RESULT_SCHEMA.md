@@ -1,7 +1,7 @@
 # Canonical Benchmark Result Schema
 
 > Status: active direction, implemented incrementally in current CLI
-> Scope: benchmark artifact unification across `run`, `compare`, `vllm-compare`, shell compatibility wrappers, parity, runtime validation, telemetry, and compatibility leaderboard export.
+> Scope: benchmark artifact unification across `run`, `compare`, shell compatibility wrappers, parity, runtime validation, telemetry, and compatibility leaderboard export.
 
 ## 1. Purpose
 
@@ -11,7 +11,6 @@ Current responsibilities:
 
 - `run`: canonical local workload benchmark pipeline
 - `compare`: canonical live multi-endpoint benchmark pipeline
-- `vllm-compare run`: thin semantic wrapper over `compare`
 - `run_benchmark.sh --profile quick`: compatibility wrapper over `run`
 - `run_benchmark.sh --profile convergence`: compatibility wrapper over `compare` plus extra probe packaging
 
@@ -50,9 +49,9 @@ The canonical schema must:
 - `run` is the mainline local workload runner.
 - `compare` is the mainline live endpoint compare runner.
 
-### 3.2 Thin wrappers
+### 3.2 Setup helpers
 
-- `vllm-compare run` is a convenience wrapper that applies standard labels, env defaults, and setup expectations before delegating to `compare`.
+- `vllm-compare install-ascend` remains an environment/bootstrap helper for validated Ascend compare setup.
 
 ### 3.3 Compatibility wrappers
 
@@ -145,7 +144,7 @@ All artifacts share one base structure:
 
 ```json
 {
-  "schema_version": "canonical-benchmark-result/v1",
+  "schema_version": "canonical-benchmark-result/v2",
   "artifact_kind": "execution_result",
   "artifact_id": "uuid",
   "produced_at": "2026-03-14T12:00:00Z",
@@ -180,7 +179,7 @@ The schema remains singular because each artifact kind uses the same envelope an
 
 ```json
 {
-  "schema_version": "canonical-benchmark-result/v1",
+  "schema_version": "canonical-benchmark-result/v2",
   "artifact_kind": "execution_result|comparison_result|run_manifest|validation_report|telemetry_capture",
   "artifact_id": "uuid",
   "produced_at": "date-time",
@@ -188,7 +187,7 @@ The schema remains singular because each artifact kind uses the same envelope an
     "tool": "sagellm-benchmark",
     "tool_version": "string",
     "command": "string",
-    "subcommand": "run|compare|compare-record|compare-offline|vllm-compare|validate-serving-consistency|perf",
+    "subcommand": "run|compare|compare-record|compare-offline|validate-serving-consistency|perf",
     "host": "string"
   },
   "provenance": {
@@ -566,11 +565,7 @@ Emit:
 
 If parity or runtime evidence exists, either embed the summary into the `execution_result` or emit attached `validation_report` / `telemetry_capture` artifacts with typed relations.
 
-### 8.3 `vllm-compare run`
-
-Same as `compare`. This is a semantic wrapper, not a distinct schema family.
-
-### 8.4 `convergence`
+### 8.3 `convergence`
 
 Emit:
 
@@ -693,7 +688,7 @@ Exporters must fail fast if any required leaderboard field cannot be derived wit
 
 1. Introduce canonical artifact builders without changing website export yet.
 2. Make `run` emit `run_manifest` plus per-workload `execution_result`.
-3. Make `compare` and `vllm-compare run` emit per-target `execution_result` plus one `compare_summary`.
+3. Make `compare` emit per-target `execution_result` plus one `compare_summary`.
 4. Attach parity, runtime consistency, and core telemetry through canonical `validation` and `telemetry` sections.
 5. Rewrite leaderboard exporter to consume only canonical `execution_result` artifacts.
 6. Deprecate direct leaderboard-first and ad hoc compare-first JSON shapes after one compatibility window.

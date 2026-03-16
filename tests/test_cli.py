@@ -9,10 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from sagellm_benchmark.cli import (
-    _apply_vllm_compare_safe_env_defaults,
+    _apply_compare_safe_env_defaults,
     _capture_target_runtime_artifacts,
     _validate_sagellm_explicit_decode_runtime,
     main,
@@ -70,6 +71,10 @@ def test_compare_help():
     assert "--model" in result.output
     assert "--hardware-family" in result.output
     assert "--batch-size" in result.output
+    assert "--dataset-name" in result.output
+    assert "--num-prompts" in result.output
+    assert "--input-len" in result.output
+    assert "--output-len" in result.output
 
 
 def test_compare_record_help():
@@ -80,6 +85,7 @@ def test_compare_record_help():
     assert "--label" in result.output
     assert "--url" in result.output
     assert "--hardware-family" in result.output
+    assert "--dataset-name" in result.output
 
 
 def test_validate_serving_consistency_help():
@@ -135,18 +141,6 @@ def test_vllm_compare_help():
     result = runner.invoke(main, ["vllm-compare", "--help"])
     assert result.exit_code == 0
     assert "install-ascend" in result.output
-    assert "run" in result.output
-
-
-def test_vllm_compare_run_help():
-    """Test vllm-compare run help."""
-    runner = CliRunner()
-    result = runner.invoke(main, ["vllm-compare", "run", "--help"])
-    assert result.exit_code == 0
-    assert "--vllm-url" in result.output
-    assert "--sagellm-url" in result.output
-    assert "--hardware-family" in result.output
-    assert "--batch-size" in result.output
 
 
 def test_parity_gate_convert_core_telemetry_help() -> None:
@@ -197,31 +191,31 @@ def test_vllm_compare_install_ascend_invokes_expected_steps(monkeypatch, tmp_pat
     assert calls[3][1] is not None
 
 
-def test_vllm_compare_safe_env_defaults_for_ascend(monkeypatch) -> None:
+def test_compare_safe_env_defaults_for_ascend(monkeypatch) -> None:
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
     monkeypatch.delenv("TORCH_DEVICE_BACKEND_AUTOLOAD", raising=False)
 
-    _apply_vllm_compare_safe_env_defaults("ascend")
+    _apply_compare_safe_env_defaults("ascend")
 
     assert os.environ["HF_ENDPOINT"] == "https://hf-mirror.com"
     assert os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
 
 
-def test_vllm_compare_safe_env_defaults_preserve_user_overrides(monkeypatch) -> None:
+def test_compare_safe_env_defaults_preserve_user_overrides(monkeypatch) -> None:
     monkeypatch.setenv("HF_ENDPOINT", "https://example.com/hf")
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
 
-    _apply_vllm_compare_safe_env_defaults("ascend")
+    _apply_compare_safe_env_defaults("ascend")
 
     assert os.environ["HF_ENDPOINT"] == "https://example.com/hf"
     assert os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "1"
 
 
-def test_vllm_compare_safe_env_defaults_for_non_ascend(monkeypatch) -> None:
+def test_compare_safe_env_defaults_for_non_ascend(monkeypatch) -> None:
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
     monkeypatch.delenv("TORCH_DEVICE_BACKEND_AUTOLOAD", raising=False)
 
-    _apply_vllm_compare_safe_env_defaults("cuda")
+    _apply_compare_safe_env_defaults("cuda")
 
     assert os.environ["HF_ENDPOINT"] == "https://hf-mirror.com"
     assert "TORCH_DEVICE_BACKEND_AUTOLOAD" not in os.environ
@@ -436,7 +430,8 @@ def test_publish_help() -> None:
     assert result.exit_code == 0
     assert "--input" in result.output
     assert "--dry-run" in result.output
-    assert "--website-dir" in result.output
+    assert "--hf-dataset" in result.output
+    assert "--website-dir" not in result.output
 
 
 def test_run_mode_parameter():
@@ -473,7 +468,7 @@ def test_mode_traffic_validation():
     assert result.exit_code == 0
 
 
-def test_run_generates_canonical_and_leaderboard_artifacts(monkeypatch):
+def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypatch):
     class FakeEngine:
         def __init__(self, config):
             self.config = config
@@ -553,20 +548,64 @@ def test_run_generates_canonical_and_leaderboard_artifacts(monkeypatch):
 
         assert result.exit_code == 0
         assert (output_dir / "Q1.canonical.json").exists()
-        assert (output_dir / "Q1_leaderboard.json").exists()
-        assert (output_dir / "leaderboard_manifest.json").exists()
+        assert not (output_dir / "Q1_leaderboard.json").exists()
+        assert not (output_dir / "leaderboard_manifest.json").exists()
         payload = json.loads((output_dir / "Q1.canonical.json").read_text(encoding="utf-8"))
-        assert payload["schema_version"] == "canonical-benchmark-result/v1"
+        assert payload["schema_version"] == "canonical-benchmark-result/v2"
         assert payload["producer"]["command"] == "run"
-        assert payload["artifacts"]["leaderboard_json"].endswith("Q1_leaderboard.json")
-        manifest = json.loads(
-            (output_dir / "leaderboard_manifest.json").read_text(encoding="utf-8")
-        )
-        assert manifest["schema_version"] == "leaderboard-export-manifest/v1"
-        assert manifest["entries"][0]["leaderboard_artifact"] == "Q1_leaderboard.json"
+        assert "leaderboard_json" not in payload["artifacts"]
 
 
-def test_run_publish_dry_run_generates_website_ready_data(monkeypatch):
+@pytest.mark.parametrize(
+    ("argv", "expected_message"),
+    [
+        (
+            [
+                "compare",
+                "--target",
+                "sagellm=http://127.0.0.1:8902/v1",
+                "--target",
+                "vllm=http://127.0.0.1:8901/v1",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
+                "--dataset-name",
+                "random",
+            ],
+            "compare dataset-backed compare requires --num-prompts --input-len --output-len; benchmark will not silently use default prompt counts or token lengths",
+        ),
+        (
+            [
+                "compare-record",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--dataset-name",
+                "sharegpt",
+            ],
+            "compare-record dataset-backed compare requires --num-prompts --input-len --output-len; benchmark will not silently use default prompt counts or token lengths",
+        ),
+    ],
+)
+def test_dataset_backed_compare_requires_explicit_prompt_shape(
+    argv: list[str],
+    expected_message: str,
+) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, argv)
+
+    assert result.exit_code != 0
+    assert expected_message in result.output
+
+
+def test_run_publish_dry_run_rejects_non_compare_leaderboard_export(monkeypatch):
     class FakeEngine:
         def __init__(self, config):
             self.config = config
@@ -619,8 +658,6 @@ def test_run_publish_dry_run_generates_website_ready_data(monkeypatch):
     runner = CliRunner()
     with runner.isolated_filesystem():
         output_dir = Path("run_publish_out")
-        website_dir = Path("website")
-        (website_dir / "data").mkdir(parents=True)
 
         result = runner.invoke(
             main,
@@ -636,18 +673,12 @@ def test_run_publish_dry_run_generates_website_ready_data(monkeypatch):
                 str(output_dir),
                 "--publish",
                 "--publish-dry-run",
-                "--publish-website-dir",
-                str(website_dir),
             ],
         )
 
-        assert result.exit_code == 0
-        assert (output_dir / "publish" / "website-ready" / "leaderboard_single.json").exists()
-        assert (output_dir / "publish" / "website-ready" / "leaderboard_multi.json").exists()
-        assert (output_dir / "publish" / "website-ready" / "last_updated.json").exists()
-        assert not (website_dir / "data" / "leaderboard_single.json").exists()
-        assert "upload dry-run" in result.output
-        assert "website sync dry-run" in result.output
+        assert result.exit_code != 0
+        assert "No leaderboard_manifest.json found under" in result.output
+        assert not (output_dir / "publish" / "website-ready" / "leaderboard_single.json").exists()
 
 
 def test_upload_hf_dry_run_requires_standard_manifest_exports() -> None:
@@ -659,3 +690,42 @@ def test_upload_hf_dry_run_requires_standard_manifest_exports() -> None:
 
         assert result.exit_code != 0
         assert "leaderboard_manifest.json" in result.output
+
+
+def test_upload_hf_is_publish_compatibility_wrapper(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_publish_workflow(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("sagellm_benchmark.cli._run_publish_workflow", fake_run_publish_workflow)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("exports")
+        output_dir.mkdir()
+
+        result = runner.invoke(
+            main,
+            [
+                "upload-hf",
+                "--input",
+                str(output_dir),
+                "--dataset",
+                "demo/repo",
+                "--token",
+                "secret",
+                "--private",
+                "--dry-run",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Compatibility layer" in result.output
+    assert captured == {
+        "benchmark_output_dir": Path("exports"),
+        "publish_hf_dataset": "demo/repo",
+        "publish_hf_token": "secret",
+        "publish_hf_private": True,
+        "publish_dry_run": True,
+    }

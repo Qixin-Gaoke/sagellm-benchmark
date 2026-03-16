@@ -31,6 +31,7 @@ from sagellm_benchmark.parity_gate import (
 # Traffic - 流量控制
 from sagellm_benchmark.traffic import (
     ArrivalPattern,
+    RampUpStrategy,
     RequestGenerator,
     TrafficController,
     TrafficProfile,
@@ -76,6 +77,7 @@ __all__ = [
     "evaluate_parity_gate",
     # Traffic
     "ArrivalPattern",
+    "RampUpStrategy",
     "TrafficProfile",
     "RequestGenerator",
     "TrafficController",

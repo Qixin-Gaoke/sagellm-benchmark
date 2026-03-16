@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ class ArrivalPattern(StrEnum):
         FIXED: 固定间隔发送
         POISSON: 泊松分布（指数间隔）
         GAMMA: Gamma 分布（支持突发流量控制）
-        BATCH: Offline Batch 模式（对标 vLLM/SGLang，一次性提交所有请求，测量总耗时）
+        BATCH: 本地批量提交模式（一次性提交所有请求，测量总耗时）
     """
 
     INSTANT = "instant"
@@ -42,6 +43,20 @@ class ArrivalPattern(StrEnum):
     POISSON = "poisson"
     GAMMA = "gamma"
     BATCH = "batch"
+
+
+class RampUpStrategy(StrEnum):
+    """请求速率爬升策略.
+
+    Attributes:
+        NONE: 不启用爬升，直接使用目标 request_rate。
+        LINEAR: 在 ramp-up 窗口内按线性曲线从低速爬升到目标速率。
+        EXPONENTIAL: 在 ramp-up 窗口内按指数曲线从低速爬升到目标速率。
+    """
+
+    NONE = "none"
+    LINEAR = "linear"
+    EXPONENTIAL = "exponential"
 
 
 @dataclass
@@ -54,8 +69,12 @@ class TrafficProfile:
         burstiness: Gamma 分布形状参数，1.0 = 泊松，<1 更突发，>1 更均匀。
         duration_s: 持续时间（秒），None 表示发完所有请求即停止。
         warmup_requests: 预热请求数（不计入统计）。
+        num_prompts: 正式测试阶段最多发射多少请求，None 表示使用全部剩余请求。
+        ramp_up_strategy: request_rate 爬升策略。
+        ramp_up_requests: 进入目标 request_rate 前的爬升窗口大小。
+        ramp_up_start_factor: 爬升起点相对目标 request_rate 的比例，范围 (0, 1]。
         seed: 随机种子（用于可复现测试）。
-        enable_batch_mode: 是否启用 Batch 模式（对标 vLLM/SGLang 的 offline throughput）。
+        enable_batch_mode: 是否启用 Batch 模式（本地一次性提交请求并测量总耗时）。
 
     Example:
         >>> # 泊松分布，10 QPS，5 个预热请求
@@ -70,7 +89,7 @@ class TrafficProfile:
         ...     pattern=ArrivalPattern.FIXED,
         ...     request_rate=20.0,
         ... )
-        >>> # Offline Batch 模式
+        >>> # 本地 Batch 模式
         >>> profile = TrafficProfile(
         ...     pattern=ArrivalPattern.BATCH,
         ...     enable_batch_mode=True,
@@ -83,8 +102,51 @@ class TrafficProfile:
     burstiness: float = 1.0
     duration_s: float | None = None
     warmup_requests: int = 0
+    num_prompts: int | None = None
+    ramp_up_strategy: RampUpStrategy = RampUpStrategy.NONE
+    ramp_up_requests: int = 0
+    ramp_up_start_factor: float = 0.1
     seed: int | None = None
     enable_batch_mode: bool = False
+
+    def __post_init__(self) -> None:
+        """校验并规范化配置."""
+        if self.request_rate is not None and math.isnan(self.request_rate):
+            raise ValueError("request_rate cannot be NaN")
+        if self.burstiness <= 0:
+            raise ValueError("burstiness must be > 0")
+        if self.warmup_requests < 0:
+            raise ValueError("warmup_requests must be >= 0")
+        if self.num_prompts is not None and self.num_prompts < 0:
+            raise ValueError("num_prompts must be >= 0")
+        if self.ramp_up_requests < 0:
+            raise ValueError("ramp_up_requests must be >= 0")
+        if not 0 < self.ramp_up_start_factor <= 1.0:
+            raise ValueError("ramp_up_start_factor must be in (0, 1]")
+
+    @property
+    def normalized_request_rate(self) -> float | None:
+        """返回归一化后的请求速率.
+
+        `None`、非正数和 `inf` 都视为不限速，以便对齐 vLLM 常见
+        `--request-rate inf` 语义，同时保持现有零延迟行为。
+        """
+        if self.request_rate is None:
+            return None
+        if math.isinf(self.request_rate):
+            return None
+        if self.request_rate <= 0:
+            return None
+        return self.request_rate
+
+    def limit_actual_requests(
+        self,
+        requests: list[BenchmarkRequest],
+    ) -> list[BenchmarkRequest]:
+        """限制正式测试阶段的请求数量."""
+        if self.num_prompts is None:
+            return requests
+        return requests[: self.num_prompts]
 
 
 class RequestGenerator:
@@ -124,7 +186,8 @@ class RequestGenerator:
         self._rng = random.Random(profile.seed)
         logger.debug(
             f"RequestGenerator initialized: pattern={profile.pattern.value}, "
-            f"rate={profile.request_rate}, requests={len(requests)}"
+            f"rate={profile.request_rate}, requests={len(requests)}, "
+            f"ramp={profile.ramp_up_strategy.value}"
         )
 
     def __aiter__(self) -> AsyncIterator[tuple[float, BenchmarkRequest]]:
@@ -162,10 +225,11 @@ class RequestGenerator:
             return 0.0
 
         # 未设置速率：无延迟
-        if self.profile.request_rate is None or self.profile.request_rate <= 0:
+        request_rate = self._effective_request_rate(index)
+        if request_rate is None:
             return 0.0
 
-        mean_interval = 1.0 / self.profile.request_rate
+        mean_interval = 1.0 / request_rate
 
         # FIXED 模式：固定间隔（第一个请求无延迟）
         if self.profile.pattern == ArrivalPattern.FIXED:
@@ -173,7 +237,7 @@ class RequestGenerator:
 
         # POISSON 模式：指数分布
         elif self.profile.pattern == ArrivalPattern.POISSON:
-            return self._rng.expovariate(self.profile.request_rate)
+            return self._rng.expovariate(request_rate)
 
         # GAMMA 模式：Gamma 分布
         elif self.profile.pattern == ArrivalPattern.GAMMA:
@@ -183,6 +247,35 @@ class RequestGenerator:
 
         # 未知模式：无延迟
         return 0.0
+
+    def _effective_request_rate(self, index: int) -> float | None:
+        """计算当前请求的有效 request_rate."""
+        base_rate = self.profile.normalized_request_rate
+        if base_rate is None:
+            return None
+        return base_rate * self._ramp_up_factor(index)
+
+    def _ramp_up_factor(self, index: int) -> float:
+        """根据 ramp-up 配置计算速率缩放因子."""
+        strategy = self.profile.ramp_up_strategy
+        ramp_up_requests = self.profile.ramp_up_requests
+        if strategy == RampUpStrategy.NONE or ramp_up_requests <= 0:
+            return 1.0
+
+        ramp_step = max(index - 1, 0)
+        if ramp_step >= ramp_up_requests:
+            return 1.0
+
+        start_factor = self.profile.ramp_up_start_factor
+        if ramp_up_requests == 1:
+            return start_factor
+
+        progress = ramp_step / (ramp_up_requests - 1)
+        if strategy == RampUpStrategy.LINEAR:
+            return start_factor + ((1.0 - start_factor) * progress)
+        if strategy == RampUpStrategy.EXPONENTIAL:
+            return start_factor * ((1.0 / start_factor) ** progress)
+        return 1.0
 
 
 class TrafficController:
@@ -266,6 +359,11 @@ class TrafficController:
             logger.warning("No requests left for actual testing after warmup")
             return []
 
+        all_requests = self.profile.limit_actual_requests(all_requests)
+        if not all_requests:
+            logger.warning("No requests left for actual testing after num_prompts limit")
+            return []
+
         logger.info(f"Starting actual test phase: {len(all_requests)} requests")
 
         # Batch 模式：记录总耗时
@@ -280,6 +378,7 @@ class TrafficController:
             # 为每个结果添加总耗时信息（用于后续聚合指标计算）
             # 注意：这里的 e2e_latency_ms 在 BATCH 模式下表示总时长，不是单个请求的延迟
             for result in results:
+                result.batch_total_time_s = total_time_s
                 if not hasattr(result, "_batch_total_time_s"):
                     result._batch_total_time_s = total_time_s
 

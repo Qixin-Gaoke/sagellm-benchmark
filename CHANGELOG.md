@@ -8,25 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- 明确 benchmark 当前入口职责与兼容层边界：`run`/`compare` 为唯一推荐主链路，`vllm-compare run` 为语义化 convenience wrapper，`run_benchmark.sh` 的 `quick`/`convergence` 为兼容 shell wrapper；相关 CLI 和文档现在都会显式提示该边界。
+- `publish` / `compare --publish` 现在会额外生成 `leaderboard_compare.json` website compare snapshot：它仍然只由 canonical `execution_result -> *_leaderboard.json -> leaderboard_manifest.json` 主链路派生，不引入第二套结果主 schema，但允许 website 直接展示 `sageLLM vs vLLM` / `vLLM-Ascend` 的 head-to-head 性能差距。
+- 新增面向 OpenAI-compatible `/v1/chat/completions` 主路径的独立 SSE 流式 benchmark 模块：可直接采集 TTFT、ITL、TPOT、E2EL、输出 token 数与成功/失败状态，并把结果映射到现有 `BenchmarkResult` / `AggregatedMetrics`；`/v1/completions` 仅保留兼容支持，不扩展为主链路。
+- 明确 benchmark 当前入口职责与兼容层边界：`run`/`compare` 为唯一推荐主链路，`vllm-compare` 仅保留安装等 setup helper，`run_benchmark.sh` 的 `quick`/`convergence` 为兼容 shell wrapper；相关 CLI 和文档现在都会显式提示该边界。
+- `traffic.py` 现增量支持更贴近 vLLM serving benchmark 的流量建模：补充 `num_prompts`、`request_rate` 归一化（含 `inf`）、可复现的 Gamma burstiness、以及 `linear` / `exponential` ramp-up，同时保持现有 `TrafficProfile` / `RequestGenerator` / `TrafficController` 结构与 batch/warmup 行为兼容。
+- compare / compare-record 现支持 dataset-backed stream benchmark：可通过 `--dataset-name random|sharegpt`、`--num-prompts`、`--input-len`、`--output-len` 直接复用现有 datasets 模块生成请求，不再只能依赖固定 synthetic prompt；同时新增 serving dataset builder 统一复用 random/sharegpt 采样逻辑。
+- README 与 QUICKSTART 现补充流式 serving benchmark、dataset 驱动压测、以及 `request_rate` / `burstiness` / `ramp_up` traffic API 的用法说明，并明确 `compare` 是唯一推荐的跨引擎入口，`vllm-compare` 仅保留 setup helper。
+
+### Fixed
+- pytest 现在会在 `tests/conftest.py` 启动最早阶段默认设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，避免 Ascend 主机直接执行 benchmark 测试时被 `torch` 隐式自动加载 `torch_npu` 卡住。
+- compare 主链路的 chat streaming 请求体现在默认只发送 `model`、`messages`、`max_tokens` 和 `stream`；不再默认附带 `stream_options.include_usage`、`temperature` 或 `top_p`，并且指标统计优先依赖本地时序与本地 token 计数而不是 endpoint usage chunk。
+- `sync_results_to_website.sh` 与 website 离线聚合主链现在会同步 `leaderboard_compare.json`，不再只更新 single/multi snapshots 后让前端临时自行拼接所有 head-to-head gap。
 
 ### Changed
-- `run`、`compare`、`vllm-compare run` 与 `compare-record` 现统一采用 canonical-first 执行链路：先写 `*.canonical.json`，再通过共享 compatibility export 边界生成 `*_leaderboard.json` 与 `leaderboard_manifest.json`，不再在各自执行路径里直接维护旧 leaderboard-first 分叉。
+- Hugging Face dataset 发布链路现统一收口到标准 `publish` 主链：仅接受 `leaderboard_manifest.json` + `*_leaderboard.json` 标准导出输入，`upload-hf` 降级为兼容包装；publish 本身不再混入 website sync，且对缺失 token / dataset / manifest / 标准 snapshot 集合的情况统一 fail-fast。
+- leaderboard/export 边界现收紧为仅接受 `canonical-benchmark-result/v2` 的 live-compare `execution_result` 工件；`leaderboard-export-entry/v2` 与 `leaderboard-export-manifest/v2` 成为唯一导出 schema，旧字段别名、旧 schema 复用、以及从本地 `run` 口径自动兜底导出 leaderboard 的路径已删除。
+- `perf` 与 `compare` 的职责边界进一步收紧：`perf --live` 现在明确只面向单 endpoint 的 operator/e2e 采集，并在传入多个 `--model` 时 fail-fast；跨引擎 live benchmark 统一收口到 `compare`。
+- `run`、`compare` 与 `compare-record` 现统一采用 canonical-first 执行链路：先写 `*.canonical.json`，再通过共享 compatibility export 边界生成 `*_leaderboard.json` 与 `leaderboard_manifest.json`，不再在各自执行路径里直接维护旧 leaderboard-first 分叉。
 - `upload-hf` 现在显式标注为兼容发布入口，推荐改用 `run --publish` 或 `compare --publish`；`run_benchmark.sh` 也会明确提示 `quick`/`convergence` 只是对新 pipeline 的包装，而不是独立主链路。
 
 ### Fixed
+- README、CLI help 与本地 batch/traffic 文案现在改用更中性的单 endpoint / local batch submission 描述，避免把 benchmark 表述成 vLLM 官方 offline throughput 或 engine latency benchmark 的复刻入口。
+- `BenchmarkResult` / `MetricsAggregator` 现在会稳定聚合流式 benchmark 的 TTFT、ITL、TPOT、E2EL 与 request/input/output throughput：聚合时会自动排除 warmup 结果，ITL 可从 `BenchmarkResult.itl_list` 回退到 `Metrics.itl_list`，E2EL 可从 timestamps 回退计算，batch 模式优先使用统一墙钟总时长而非松散的单请求时间窗，并补齐了失败请求、零输出与 batch/warmup 边界测试。
 - `run --dataset sharegpt` 在数据集加载失败时不再静默回退到默认 prompts，改为 fail-fast 抛出明确错误，继续遵守 benchmark 的 no silent fallback 约束。
-- `compare` / `vllm-compare run` 对 `sagellm*` 目标重新恢复 explicit decode mainline 的 fail-fast 验证：若 `/info` 未证明 `runtime.native_decode.v1` 默认开启且实际开启、`kill_switch` 未激活、`decode_runtime_diagnostics.summary` 为空，或 core step telemetry 缺失/为 0，则 compare 直接失败，不再静默产出误导性的成功工件。
+- `compare` 对 `sagellm*` 目标重新恢复 explicit decode mainline 的 fail-fast 验证：若 `/info` 未证明 `runtime.native_decode.v1` 默认开启且实际开启、`kill_switch` 未激活、`decode_runtime_diagnostics.summary` 为空，或 core step telemetry 缺失/为 0，则 compare 直接失败，不再静默产出误导性的成功工件。
 
 ### Added
-- 新增标准 `canonical artifact -> leaderboard entry` 导出层：`exporters/leaderboard.py` 现在直接消费 `*.canonical.json` 的 `execution_result` 工件，统一为 `run`、`compare`、`vllm-compare run` 生成 website / HF 兼容的 `*_leaderboard.json`，并集中维护 workload(Q1-Q8) 映射、engine 标签、cluster/config_type 推断与 idempotency key / canonical path 语义。
+- 新增标准 `canonical artifact -> leaderboard entry` 导出层：`exporters/leaderboard.py` 现在直接消费 `*.canonical.json` 的 `execution_result` 工件，统一为 `run`、`compare` 与 `compare-record` 生成 website / HF 兼容的 `*_leaderboard.json`，并集中维护 workload(Q1-Q8) 映射、engine 标签、cluster/config_type 推断与 idempotency key / canonical path 语义。
 - 所有标准 leaderboard 导出现在会在 benchmark 输出目录同步写入 `leaderboard_manifest.json`；`upload-hf` 只消费该 manifest 指向的标准 `*_leaderboard.json` 工件，并在上传 canonical per-entry 文件的同时刷新 HF snapshot `leaderboard_single.json`、`leaderboard_multi.json` 与 `last_updated.json`。
 - 新增 [docs/CANONICAL_RESULT_SCHEMA.md](docs/CANONICAL_RESULT_SCHEMA.md)，系统定义 benchmark 统一 canonical artifact schema 设计：用一个带 `artifact_kind` 的结果信封覆盖本地 `run`、endpoint `compare` / `vllm-compare`、Q1-Q8 workload、parity/runtime validation、core telemetry、artifact provenance 与 leaderboard 导出字段，并补充现有 `e2e` / `compare` / `*_leaderboard.json` 到新 schema 的映射关系。
-- `run`、`compare` 与 `vllm-compare run` 现在都会先落盘 `*.canonical.json` 作为统一内部 benchmark artifact，再继续生成 parity / leaderboard 等派生产物；CPU 本地 run 也改为通过同一 canonical artifact 导出 leaderboard，减少旧 `run` 链路与 endpoint compare 链路的产物分叉。
+- `run`、`compare` 与 `compare-record` 现在都会先落盘 `*.canonical.json` 作为统一内部 benchmark artifact，再继续生成 parity / leaderboard 等派生产物；CPU 本地 run 也改为通过同一 canonical artifact 导出 leaderboard，减少旧 `run` 链路与 endpoint compare 链路的产物分叉。
 
 ### Fixed
-- `vllm-compare run` 现在会为 compare 进程自动补齐安全环境默认值：默认设置 `HF_ENDPOINT=https://hf-mirror.com`，并在 `--hardware-family ascend` 时默认设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`。若用户已显式设置这些环境变量，则继续尊重用户覆盖值。
-- `vllm-compare run` 的 tokenizer / config 探测现在会在导入 `transformers` 前就初始化 `HF_ENDPOINT=https://hf-mirror.com`，避免 benchmark 进程因为 Hugging Face endpoint 环境变量设置过晚而继续直连 `huggingface.co`。
+- `compare` / `compare-record` 现在会为 benchmark 进程自动补齐安全环境默认值：默认设置 `HF_ENDPOINT=https://hf-mirror.com`，并在 `--hardware-family ascend` 时默认设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`。若用户已显式设置这些环境变量，则继续尊重用户覆盖值。
+- `compare` / `compare-record` 的 tokenizer / config 探测现在会在导入 `transformers` 前就初始化 `HF_ENDPOINT=https://hf-mirror.com`，避免 benchmark 进程因为 Hugging Face endpoint 环境变量设置过晚而继续直连 `huggingface.co`。
 - 空的 `performance_mainline.explicit_decode` 遥测不再让 benchmark 在 `CoreDecodeTelemetrySummary` 构造阶段崩溃；compare 现在允许空 summary，并在 core telemetry artifact 不可构造时仅保留 `info_json`，不再因辅助遥测缺失直接打断整个 compare。
 
 ### Changed
@@ -39,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 `sagellm-benchmark validate-serving-consistency` 与 `runtime_consistency.py`：在真实 endpoint 上复用 live compare 采集链路执行最小 small-batch decode 复测，并对 `/info`、`performance_mainline.decode_runtime_diagnostics`、自动生成的 `core_telemetry` 以及 backend round3 benchmark artifact 做 fail-fast 一致性校验，直接暴露“内部 native、服务端 fallback”这类 split-brain 失配。
 - 新增 `parity_gate.py` 与 `sagellm-benchmark parity-gate ...` CLI，正式定义可复用的 decode parity gate schema：固定 `bs=1/2/4`、warmup/repeat、correctness、fallback-rate、step-evidence、TBT/throughput 判定带，并支持把现有 `compare-record` / `compare` 生成的 `e2e` 工件转换为 gate 输入，明确区分 `performance` / `correctness` / `fallback` / `capability` / `telemetry` 失败类别。
 - 新增 `core_telemetry.py` 与 `sagellm-benchmark parity-gate convert-core-telemetry`：可直接消费 `sagellm-core` 的 `LLMEngine.get_info()` / `performance_mainline.explicit_decode` 输出，按稳定字段校验并生成 `core-decode-step-telemetry/v1` 工件与按 `batch_size` / `selected_implementation` / `selected_operator_pack` 聚合的摘要，供 backend before/after 与 parity 分析复用。
-- `compare`、`compare-record` 与 `vllm-compare run` 现在会在 live compare 同步落盘 `<label>.parity.json`，直接产出 `parity-run/v1` artifact；缺少 `hardware_family`、吞吐字段或 correctness 字段时显式失败，不再依赖手工转换临时整理。
+- `compare` 与 `compare-record` 现在会在 live compare 同步落盘 `<label>.parity.json`，直接产出 `parity-run/v1` artifact；缺少 `hardware_family`、吞吐字段或 correctness 字段时显式失败，不再依赖手工转换临时整理。
 - `compare` / `compare-record` 现在会 best-effort 抓取目标 endpoint 的 `/info` 并自动落盘 `<label>_info.json`；当 `/info` 中存在 `performance_mainline.explicit_decode` 时，还会自动生成 `<label>_core_telemetry.json`，使 live compare 工件可直接复用到 decode parity / backend before-after 分析，而不再需要手工二次转换当前运行结果。
 
 ### Fixed

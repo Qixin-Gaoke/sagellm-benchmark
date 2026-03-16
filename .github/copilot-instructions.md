@@ -23,8 +23,8 @@ When asked to update package version, change only `_version.py`.
 - `sagellm-benchmark` owns third-party engine comparison responsibilities: dependency extras, convenience install scripts, endpoint liveness checks, and live metrics collection all stay on the benchmark side.
 - For the standard `sageLLM vs vLLM` workflow, prefer the dedicated benchmark CLI:
    - `sagellm-benchmark vllm-compare install-ascend`
-   - `sagellm-benchmark vllm-compare run --sagellm-url <url> --vllm-url <url> --model <model>`
-- `sagellm-benchmark compare` remains the generic multi-endpoint entrypoint; `vllm-compare` is the thin, semantic wrapper for the common vLLM comparison path.
+   - `sagellm-benchmark compare --target sagellm=<url> --target vllm=<url> --model <model> --hardware-family <family>`
+- `sagellm-benchmark compare` is the only live multi-endpoint benchmark entrypoint; `vllm-compare` is reserved for validated environment/setup helpers.
 - `scripts/setup_vllm_ascend_compare_env.sh` is a compatibility/ops layer only. Do not add new primary logic there when the same behavior belongs in the CLI.
 - Benchmark dependency declarations must live in `pyproject.toml` extras. Scripts may pin a validated environment matrix, but must not become an alternate source of truth for compare-client dependencies.
 - When an Ascend host only has the `vllm-ascend` plugin but not the `vllm` package/module, treat that as an environment-matrix or package-layout issue first. Do not keep forcing `python -m vllm.entrypoints.openai.api_server` inside the main `sagellm` env.
@@ -44,7 +44,7 @@ When asked to update package version, change only `_version.py`.
 ### train05 / current Ascend host practical rules
 
 - Prefer `sagellm-benchmark vllm-compare install-ascend` over directly invoking setup shell scripts in new instructions, examples, or automation.
-- Prefer `sagellm-benchmark vllm-compare run` over passing anonymous `endpoint_a/endpoint_b` style arguments in new instructions, examples, or automation.
+- Prefer `sagellm-benchmark compare --target sagellm=<url> --target vllm=<url>` over anonymous `endpoint_a/endpoint_b` style arguments in new instructions, examples, or automation.
 - Always inject Ascend runtime before startup via wrapper:
    - `cd /home/user8/sagellm`
    - `./scripts/sagellm_with_ascend_env.sh <python-or-server-command>`
@@ -56,7 +56,7 @@ When asked to update package version, change only `_version.py`.
    - `cd /home/user8/sagellm`
    - `HF_ENDPOINT=https://hf-mirror.com ./scripts/sagellm_with_ascend_env.sh sagellm serve --backend ascend --model <model> --host 127.0.0.1 --port 8901 --benchmark-mode`
 - For containerized `vllm-ascend`, the readiness contract is still fail-fast and identical to native startup: port listener, process fingerprint, `/health`, and `/v1/models` must all pass before compare is considered valid.
-- Do not confuse “endpoint is up” with “benchmark compare is fully ready”. If `sagellm-benchmark vllm-compare run` still crashes in the benchmark process because of tokenizer download policy, `torch_npu` autoload side effects, or empty `/info` telemetry validation, mark that as a benchmark-side blocker explicitly.
+- Do not confuse “endpoint is up” with “benchmark compare is fully ready”. If `sagellm-benchmark compare` still crashes in the benchmark process because of tokenizer download policy, `torch_npu` autoload side effects, or empty `/info` telemetry validation, mark that as a benchmark-side blocker explicitly.
 - If `python -m vllm.entrypoints.openai.api_server` fails with module-missing/entrypoint-mismatch, treat it as environment/package-layout issue first; do not continue benchmark with an unverified server.
 - Startup success criteria are mandatory (all pass):
    - Port bind: `ss -ltnp | grep -E ':<port>'`
@@ -95,4 +95,6 @@ When asked to update package version, change only `_version.py`.
 - 永远不要创建 `.venv` 或 `venv`（无任何例外）。
 - NEVER create `.venv`/`venv` in this repository under any circumstance.
 - 必须复用当前已配置的非-venv Python 环境（如现有 conda 环境）。
+- 所有测试、lint、脚本执行都必须使用当前已配置的 conda 环境；禁止为了运行命令而新建或激活仓库内虚拟环境。
+- 禁止建议或执行 `python -m venv`、`uv venv`、`virtualenv`、`source .venv/bin/activate` 等命令。
 - If any script/task suggests creating a virtualenv, skip that step and continue with the existing environment.

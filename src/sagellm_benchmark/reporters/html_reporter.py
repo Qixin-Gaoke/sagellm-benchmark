@@ -39,6 +39,22 @@ class HTMLReporter:
     """
 
     @staticmethod
+    def _optional_metric_value(value: float | int | None) -> float | int | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and value <= 0:
+            return None
+        return value
+
+    @staticmethod
+    def _format_metric(value: float | int | None, unit: str = "") -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, float):
+            return f"{value:.2f}{unit}"
+        return f"{value}{unit}"
+
+    @staticmethod
     def generate(
         metrics: AggregatedMetrics,
         contract: ContractResult | None = None,
@@ -155,6 +171,21 @@ class HTMLReporter:
                     "data": [r.avg_tbt_ms for r in runs],
                     "backgroundColor": "rgba(75, 192, 192, 0.7)",
                 },
+                {
+                    "label": "Avg TPOT (ms)",
+                    "data": [HTMLReporter._optional_metric_value(r.avg_tpot_ms) for r in runs],
+                    "backgroundColor": "rgba(99, 102, 241, 0.7)",
+                },
+                {
+                    "label": "Avg ITL (ms)",
+                    "data": [HTMLReporter._optional_metric_value(r.avg_itl_ms) for r in runs],
+                    "backgroundColor": "rgba(16, 185, 129, 0.7)",
+                },
+                {
+                    "label": "Avg E2EL (ms)",
+                    "data": [HTMLReporter._optional_metric_value(r.avg_e2el_ms) for r in runs],
+                    "backgroundColor": "rgba(245, 158, 11, 0.7)",
+                },
             ],
         }
 
@@ -221,18 +252,107 @@ class HTMLReporter:
                 _metric_row("P95 TTFT", [_fmt(r.p95_ttft_ms, " ms") for r in runs]),
                 _metric_row("P99 TTFT", [_fmt(r.p99_ttft_ms, " ms") for r in runs]),
                 _metric_row("Avg TBT", [_fmt(r.avg_tbt_ms, " ms") for r in runs]),
-                _metric_row("Avg TPOT", [_fmt(r.avg_tpot_ms, " ms") for r in runs]),
+                _metric_row(
+                    "Avg TPOT",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.avg_tpot_ms),
+                            " ms",
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "Avg ITL",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.avg_itl_ms),
+                            " ms",
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "P95 ITL",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.p95_itl_ms),
+                            " ms",
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "Avg E2EL",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.avg_e2el_ms),
+                            " ms",
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "P95 E2EL",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.p95_e2el_ms),
+                            " ms",
+                        )
+                        for r in runs
+                    ],
+                ),
                 _metric_row(
                     "Request Throughput",
-                    [_fmt(r.request_throughput_rps, " req/s") for r in runs],
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.request_throughput_rps),
+                            " req/s",
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "Input Throughput",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.input_throughput_tps),
+                            " tokens/s",
+                        )
+                        for r in runs
+                    ],
                 ),
                 _metric_row(
                     "Output Throughput",
-                    [_fmt(r.output_throughput_tps, " tokens/s") for r in runs],
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.output_throughput_tps),
+                            " tokens/s",
+                        )
+                        for r in runs
+                    ],
                 ),
                 _metric_row(
                     "Total Throughput",
                     [_fmt(r.total_throughput_tps, " tokens/s") for r in runs],
+                ),
+                _metric_row(
+                    "Total Input Tokens",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.total_input_tokens)
+                        )
+                        for r in runs
+                    ],
+                ),
+                _metric_row(
+                    "Total Output Tokens",
+                    [
+                        HTMLReporter._format_metric(
+                            HTMLReporter._optional_metric_value(r.total_output_tokens)
+                        )
+                        for r in runs
+                    ],
                 ),
                 _metric_row("Peak Memory", [_fmt(r.peak_mem_mb, " MB") for r in runs]),
                 _metric_row(
@@ -360,11 +480,15 @@ class HTMLReporter:
             </div>
             <div class="info-item">
                 <div class="label">Output Throughput</div>
-                <div class="value">{runs[-1].output_throughput_tps:.1f} tok/s</div>
+                <div class="value">{HTMLReporter._format_metric(HTMLReporter._optional_metric_value(runs[-1].output_throughput_tps), " tok/s")}</div>
             </div>
             <div class="info-item">
                 <div class="label">Request Throughput</div>
-                <div class="value">{runs[-1].request_throughput_rps:.2f} req/s</div>
+                <div class="value">{HTMLReporter._format_metric(HTMLReporter._optional_metric_value(runs[-1].request_throughput_rps), " req/s")}</div>
+            </div>
+            <div class="info-item">
+                <div class="label">Avg E2EL</div>
+                <div class="value">{HTMLReporter._format_metric(HTMLReporter._optional_metric_value(runs[-1].avg_e2el_ms), " ms")}</div>
             </div>
             <div class="info-item">
                 <div class="label">Error Rate</div>

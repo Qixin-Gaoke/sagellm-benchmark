@@ -1,4 +1,4 @@
-"""E2E model-level benchmarks for sagellm-benchmark (#45/#46)."""
+"""E2E single-endpoint model benchmarks for sagellm-benchmark (#45/#46)."""
 
 from __future__ import annotations
 
@@ -40,9 +40,12 @@ def run_e2e_model_benchmarks(
     Uses deterministic simulation mode by default to keep CI stable.
     In live mode (simulate=False), sends real requests to an OpenAI-compatible
     API server (e.g., sagellm-gateway or sagellm-core engine_server).
+    This path is intentionally scoped to a single endpoint; cross-engine live
+    benchmarking belongs to ``compare`` / ``vllm-compare``.
 
     Args:
-        models: List of model names/paths to benchmark.
+        models: List of model names/paths to benchmark. Live mode should receive
+            exactly one model label because the endpoint serves one model at a time.
         batch_sizes: List of batch sizes to test.
         precisions: Precision labels (simulation only; live mode uses server precision).
         simulate: If True, use deterministic simulation. If False, run live requests.
@@ -237,6 +240,8 @@ async def _run_live_benchmarks(
     max_output_tokens_override: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run live E2E benchmarks against a real API server.
+
+    This is a single-endpoint sampling path. It is not a cross-engine compare runner.
 
     Args:
         models: Model names/paths to benchmark.
