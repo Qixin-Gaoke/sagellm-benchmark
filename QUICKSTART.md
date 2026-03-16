@@ -2,7 +2,7 @@
 
 ## What is this?
 
-sageLLM Benchmark is a standardized testing suite for validating LLM inference engines. It runs **Q1-Q8 query workloads** covering diverse LLM scenarios:
+sageLLM Benchmark is a standardized testing suite for validating LLM inference engines. It uses a **profile-first mainline** and optional **Q1-Q8 supplement workloads**.
 
 | Workload | Type | Prompt Tokens | Max Output | Requests | Concurrent |
 |----------|------|---------------|------------|----------|------------|
@@ -132,8 +132,11 @@ docker logs sagellm-benchmark-vllm | tail -n 200
 ```bash
 cd sagellm-benchmark
 
-# Canonical local benchmark path
-sagellm-benchmark run --workload all --backend cpu --output ./benchmark_results
+# Canonical local benchmark path (mainline only)
+sagellm-benchmark run --profile vllm_random --backend cpu --output ./benchmark_results
+
+# Mainline + Q1-Q8 supplement
+sagellm-benchmark run --profile vllm_random --supplement q1q8_supplement --backend cpu
 
 # Reporting helper over existing artifacts
 sagellm-benchmark report --input ./benchmark_results/benchmark_summary.json --format table
@@ -182,7 +185,7 @@ sagellm-benchmark compare \
   --hardware-family cuda
 ```
 
-### Option 4: Dataset-Backed Streaming Serving Benchmark
+### Option 4: Profile-First Streaming Serving Benchmark
 
 ```bash
 # Synthetic random prompts through the canonical stream compare path
@@ -191,10 +194,7 @@ sagellm-benchmark compare \
   --target vllm=http://127.0.0.1:8000/v1 \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --hardware-family cuda \
-  --dataset-name random \
-  --num-prompts 128 \
-  --input-len 512 \
-  --output-len 128
+  --profile vllm_random
 
 # ShareGPT-backed prompts on the same canonical compare transport
 sagellm-benchmark compare \
@@ -202,10 +202,7 @@ sagellm-benchmark compare \
   --target vllm=http://127.0.0.1:8000/v1 \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --hardware-family cuda \
-  --dataset-name sharegpt \
-  --num-prompts 64 \
-  --input-len 1024 \
-  --output-len 256
+  --profile vllm_sharegpt
 ```
 
 这条主线走的是 OpenAI-compatible `/v1/chat/completions` + `stream=true`。结果里会聚合 TTFT、ITL、TPOT、E2EL、request throughput、input throughput 和 output throughput。
@@ -214,9 +211,9 @@ sagellm-benchmark compare \
 
 参数语义：
 
-- `--dataset-name default` 继续使用内建 short/long serving scenarios。
-- `--dataset-name random|sharegpt` 会切换到 dataset 驱动压测。
-- dataset 模式下必须同时提供 `--num-prompts`、`--input-len`、`--output-len`。
+- 主线 profile：`vllm_random`、`vllm_sharegpt`、`vllm_hf`、`vllm_custom`
+- supplements：`q1q8_supplement`
+- `vllm_custom` 必须同时提供 `--dataset-path`、`--num-prompts`、`--input-len`、`--output-len`（fail-fast）
 
 ### Option 5: Sequential Capture Then Offline Compare
 
@@ -226,7 +223,7 @@ sagellm-benchmark compare-record \
   --url http://127.0.0.1:8901/v1 \
   --hardware-family cuda \
   --model Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset-name sharegpt \
+  --profile vllm_sharegpt \
   --num-prompts 64 \
   --input-len 1024 \
   --output-len 256 \
@@ -237,7 +234,7 @@ sagellm-benchmark compare-record \
   --url http://127.0.0.1:8000/v1 \
   --hardware-family cuda \
   --model Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset-name sharegpt \
+  --profile vllm_sharegpt \
   --num-prompts 64 \
   --input-len 1024 \
   --output-len 256 \
@@ -390,16 +387,16 @@ sagellm-benchmark run --backend cpu --model gpt2
 
 ```bash
 # Run specific query workload
-sagellm-benchmark run --workload Q3 --backend cpu
+sagellm-benchmark run --profile vllm_random --supplement q1q8_supplement --backend cpu
 
 # Run in batch mode (offline throughput, vLLM/SGLang compatible)
-sagellm-benchmark run --workload all --backend cpu --mode batch
+sagellm-benchmark run --profile vllm_random --backend cpu --mode batch
 
 # Run with custom JSON output
-sagellm-benchmark run --workload all --backend cpu --output-json ./my_results.json
+sagellm-benchmark run --profile vllm_random --backend cpu --output-json ./my_results.json
 
 # Run with verbose logging
-sagellm-benchmark run --workload all --backend cpu -v
+sagellm-benchmark run --profile vllm_random --backend cpu -v
 
 # Custom output directory
 sagellm-benchmark run --output ./my_results
@@ -488,7 +485,7 @@ sagellm-benchmark run --backend cpu --model gpt2
 
 Run benchmark first:
 ```bash
-sagellm-benchmark run --workload all --backend cpu
+sagellm-benchmark run --profile vllm_random --backend cpu
 ```
 
 ## Next Steps
@@ -504,10 +501,10 @@ sageLLM Benchmark now supports modes compatible with vLLM and SGLang:
 
 ```bash
 # Batch mode - comparable to vLLM's offline throughput
-sagellm-benchmark run --workload all --backend cpu --mode batch
+sagellm-benchmark run --profile vllm_random --backend cpu --mode batch
 
 # Traffic mode - comparable to SGLang's serving benchmark
-sagellm-benchmark run --workload all --backend cpu --mode traffic
+sagellm-benchmark run --profile vllm_random --backend cpu --mode traffic
 ```
 
 做真实跨引擎 live endpoint 对比时，统一使用 `sagellm-benchmark compare`。
@@ -530,7 +527,7 @@ See [USAGE.md - Benchmarking Against vLLM/SGLang](../docs/USAGE.md#benchmarking-
 ```bash
 # Quick start in 3 commands:
 pip install isagellm-benchmark
-sagellm-benchmark run --workload all --backend cpu
+sagellm-benchmark run --profile vllm_random --backend cpu
 sagellm-benchmark report
 ```
 

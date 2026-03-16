@@ -47,7 +47,8 @@ def test_run_help():
     runner = CliRunner()
     result = runner.invoke(main, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--workload" in result.output
+    assert "--profile" in result.output
+    assert "--supplement" in result.output
     assert "--backend" in result.output
     assert "--model" in result.output
     assert "--output" in result.output
@@ -71,7 +72,8 @@ def test_compare_help():
     assert "--model" in result.output
     assert "--hardware-family" in result.output
     assert "--batch-size" in result.output
-    assert "--dataset-name" in result.output
+    assert "--profile" in result.output
+    assert "--supplement" in result.output
     assert "--num-prompts" in result.output
     assert "--input-len" in result.output
     assert "--output-len" in result.output
@@ -85,7 +87,7 @@ def test_compare_record_help():
     assert "--label" in result.output
     assert "--url" in result.output
     assert "--hardware-family" in result.output
-    assert "--dataset-name" in result.output
+    assert "--profile" in result.output
 
 
 def test_validate_serving_consistency_help():
@@ -496,7 +498,7 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
                 successful_requests=2,
                 failed_requests=0,
             )
-            metrics_path = self.config.output_dir / "Q1_metrics.json"
+            metrics_path = self.config.output_dir / "vllm_random_b1_metrics.json"
             metrics_path.write_text(
                 json.dumps(
                     {
@@ -512,14 +514,14 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
             summary_path.write_text(
                 json.dumps(
                     {
-                        "workloads": {"Q1": {"avg_ttft_ms": metrics.avg_ttft_ms}},
+                        "workloads": {"vllm_random_b1": {"avg_ttft_ms": metrics.avg_ttft_ms}},
                         "overall": {"total_workloads": 1, "total_requests": 2},
                     },
                     indent=2,
                 ),
                 encoding="utf-8",
             )
-            return {"Q1": metrics}
+            return {"vllm_random_b1": metrics}
 
     monkeypatch.setitem(
         sys.modules,
@@ -535,8 +537,10 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
             main,
             [
                 "run",
-                "--workload",
-                "Q1",
+                "--profile",
+                "vllm_random",
+                "--batch-size",
+                "1",
                 "--backend",
                 "cpu",
                 "--model",
@@ -547,10 +551,12 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
         )
 
         assert result.exit_code == 0
-        assert (output_dir / "Q1.canonical.json").exists()
-        assert not (output_dir / "Q1_leaderboard.json").exists()
+        assert (output_dir / "vllm_random_b1.canonical.json").exists()
+        assert not (output_dir / "vllm_random_b1_leaderboard.json").exists()
         assert not (output_dir / "leaderboard_manifest.json").exists()
-        payload = json.loads((output_dir / "Q1.canonical.json").read_text(encoding="utf-8"))
+        payload = json.loads(
+            (output_dir / "vllm_random_b1.canonical.json").read_text(encoding="utf-8")
+        )
         assert payload["schema_version"] == "canonical-benchmark-result/v2"
         assert payload["producer"]["command"] == "run"
         assert "leaderboard_json" not in payload["artifacts"]
@@ -570,10 +576,10 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
                 "Qwen/Qwen2.5-0.5B-Instruct",
                 "--hardware-family",
                 "cuda",
-                "--dataset-name",
-                "random",
+                "--profile",
+                "vllm_custom",
             ],
-            "compare dataset-backed compare requires --num-prompts --input-len --output-len; benchmark will not silently use default prompt counts or token lengths",
+            "vllm_custom requires --dataset-path",
         ),
         (
             [
@@ -586,14 +592,16 @@ def test_run_generates_canonical_artifacts_without_leaderboard_exports(monkeypat
                 "cuda",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
-                "--dataset-name",
-                "sharegpt",
+                "--profile",
+                "vllm_custom",
+                "--dataset-path",
+                "./sharegpt.json",
             ],
-            "compare-record dataset-backed compare requires --num-prompts --input-len --output-len; benchmark will not silently use default prompt counts or token lengths",
+            "vllm_custom requires --num-prompts",
         ),
     ],
 )
-def test_dataset_backed_compare_requires_explicit_prompt_shape(
+def test_profile_custom_requires_explicit_shape(
     argv: list[str],
     expected_message: str,
 ) -> None:
@@ -632,21 +640,21 @@ def test_run_publish_dry_run_rejects_non_compare_leaderboard_export(monkeypatch)
                 successful_requests=2,
                 failed_requests=0,
             )
-            (self.config.output_dir / "Q1_metrics.json").write_text(
+            (self.config.output_dir / "vllm_random_b1_metrics.json").write_text(
                 json.dumps({"avg_ttft_ms": metrics.avg_ttft_ms}, indent=2),
                 encoding="utf-8",
             )
             (self.config.output_dir / "benchmark_summary.json").write_text(
                 json.dumps(
                     {
-                        "workloads": {"Q1": {"avg_ttft_ms": metrics.avg_ttft_ms}},
+                        "workloads": {"vllm_random_b1": {"avg_ttft_ms": metrics.avg_ttft_ms}},
                         "overall": {"total_workloads": 1, "total_requests": 2},
                     },
                     indent=2,
                 ),
                 encoding="utf-8",
             )
-            return {"Q1": metrics}
+            return {"vllm_random_b1": metrics}
 
     monkeypatch.setitem(
         sys.modules,
@@ -663,8 +671,10 @@ def test_run_publish_dry_run_rejects_non_compare_leaderboard_export(monkeypatch)
             main,
             [
                 "run",
-                "--workload",
-                "Q1",
+                "--profile",
+                "vllm_random",
+                "--batch-size",
+                "1",
                 "--backend",
                 "cpu",
                 "--model",

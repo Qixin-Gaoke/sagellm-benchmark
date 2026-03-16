@@ -79,7 +79,8 @@ sagellm-benchmark parity-gate evaluate \
 
 ## Features
 
-- End-to-end Q1-Q8 query workloads covering diverse LLM scenarios
+- Profile-first benchmark mainline (`vllm_random` / `vllm_sharegpt` / `vllm_hf` / `vllm_custom`)
+- Q1-Q8 supplement workloads (`q1q8_supplement`) integrated into the same compare/run pipeline
 - Standardized JSON metrics and reports
 - One-command benchmark runner
 - Extensible backend support
@@ -130,11 +131,11 @@ Recommended benchmark mainline:
 - `sagellm-benchmark report` only as a reporting helper over existing artifacts.
 
 ```bash
-# Run all Q1-Q8 workloads with CPU backend
-sagellm-benchmark run --workload all --backend cpu --output ./benchmark_results
+# Mainline-only local run
+sagellm-benchmark run --profile vllm_random --backend cpu --output ./benchmark_results
 
-# Run a single query workload
-sagellm-benchmark run --workload Q1 --backend cpu
+# Mainline + Q1-Q8 supplement
+sagellm-benchmark run --profile vllm_random --supplement q1q8_supplement --backend cpu
 
 # Generate a markdown report from existing artifacts
 sagellm-benchmark report --input ./benchmark_results/benchmark_summary.json --format markdown
@@ -160,27 +161,22 @@ sagellm-benchmark compare \
 # with leaderboard_single.json, leaderboard_multi.json,
 # leaderboard_compare.json, and last_updated.json.
 
-# Dataset-backed streaming serving benchmark over OpenAI-compatible endpoints
+# Profile-first streaming benchmark over OpenAI-compatible endpoints
 sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
    --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
-   --dataset-name random \
-   --num-prompts 128 \
-   --input-len 512 \
-   --output-len 128
+   --profile vllm_random
 
-# Reuse sampled prompts from ShareGPT instead of synthetic random prompts
+# Mainline + supplement in one run
 sagellm-benchmark compare \
    --target sagellm=http://127.0.0.1:8902/v1 \
    --target vllm=http://127.0.0.1:8901/v1 \
    --hardware-family cuda \
    --model Qwen/Qwen2.5-0.5B-Instruct \
-   --dataset-name sharegpt \
-   --num-prompts 64 \
-   --input-len 1024 \
-   --output-len 256
+   --profile vllm_random \
+   --supplement q1q8_supplement
 
 # Add --publish only when you also want the explicit HF dataset publish step.
 sagellm-benchmark compare \
@@ -221,7 +217,7 @@ sagellm-benchmark compare-record \
    --url http://127.0.0.1:8901/v1 \
    --hardware-family cuda \
    --model Qwen/Qwen2.5-1.5B-Instruct \
-   --dataset-name sharegpt \
+   --profile vllm_sharegpt \
    --num-prompts 64 \
    --input-len 1024 \
    --output-len 256 \
@@ -314,7 +310,7 @@ sagellm-benchmark perf --type e2e --plot --plot-format png --plot-format pdf --t
 
 # Explicit publish dry-run from the benchmark CLI main path
 sagellm-benchmark run \
-   --workload Q1 \
+   --profile vllm_random --supplement q1q8_supplement \
    --backend cpu \
    --model sshleifer/tiny-gpt2 \
    --output ./benchmark_results/publish_demo \
@@ -363,11 +359,12 @@ The productized compare path is now:
 
 Prompt source options for the stream compare pipeline:
 
-- `--dataset-name default`: built-in short/long serving scenarios per batch size.
-- `--dataset-name random`: synthetic prompts sampled through the serving dataset builder.
-- `--dataset-name sharegpt`: ShareGPT-backed prompts sampled through the same serving dataset builder.
+- `--profile vllm_random`: synthetic prompts sampled through the serving dataset builder.
+- `--profile vllm_sharegpt`: ShareGPT-backed prompts sampled through the same serving dataset builder.
+- `--profile vllm_hf`: HuggingFace-backed ShareGPT sampling profile.
+- `--profile vllm_custom`: user-provided dataset path + explicit prompt shape.
 
-Dataset-backed compare requires the full tuple `--dataset-name`, `--num-prompts`, `--input-len`, and `--output-len`. This keeps the transport and aggregation path unchanged while swapping prompt corpora and token budgets.
+`vllm_custom` requires the full tuple `--dataset-path`, `--num-prompts`, `--input-len`, and `--output-len` (fail-fast). This keeps the transport and aggregation path unchanged while swapping prompt corpora and token budgets.
 
 ## Traffic Shaping API
 
@@ -514,13 +511,13 @@ CLI examples:
 
 ```bash
 # Run the full Q1-Q8 suite with the CPU backend
-sagellm-benchmark run --workload all --backend cpu
+sagellm-benchmark run --profile vllm_random --backend cpu
 
 # Run with a CPU model
-sagellm-benchmark run --workload all --backend cpu --model sshleifer/tiny-gpt2
+sagellm-benchmark run --profile vllm_random --backend cpu --model sshleifer/tiny-gpt2
 
 # Run a single query workload
-sagellm-benchmark run --workload Q3 --backend cpu
+sagellm-benchmark run --profile vllm_random --supplement q1q8_supplement --backend cpu
 
 # Generate reports
 sagellm-benchmark report --input ./benchmark_results/benchmark_summary.json --format markdown

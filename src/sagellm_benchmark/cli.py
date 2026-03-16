@@ -49,6 +49,11 @@ from sagellm_benchmark.runtime_consistency import (
     build_live_runtime_consistency_report,
     extract_runtime_info_payload,
 )
+from sagellm_benchmark.workload_profiles import (
+    MAINLINE_SCENARIO_SOURCE,
+    build_execution_plan,
+    profile_to_serving_dataset,
+)
 
 console = Console()
 
@@ -78,13 +83,17 @@ def _export_stream_leaderboard_artifacts(
     *,
     benchmark_output_dir: Path,
     source_command: str,
+    include_supplements: bool,
 ) -> dict[str, object]:
     console.print(
         "[cyan]Leaderboard export:[/cyan] "
         f"{source_command} derives leaderboard artifacts from canonical live-compare outputs only."
     )
     try:
-        export_summary = export_standard_leaderboard_artifacts(benchmark_output_dir)
+        export_summary = export_standard_leaderboard_artifacts(
+            benchmark_output_dir,
+            include_supplements=include_supplements,
+        )
     except Exception as exc:
         raise click.ClickException(f"leaderboard export failure: {exc}") from exc
 
@@ -489,12 +498,14 @@ def _prepare_compare_publish_ready_outputs(
     *,
     benchmark_output_dir: Path,
     source_command: str,
+    include_supplements: bool,
 ) -> dict[str, object]:
     """Finalize standard compare outputs for downstream publish and website consumption."""
     try:
         export_summary = _export_stream_leaderboard_artifacts(
             benchmark_output_dir=benchmark_output_dir,
             source_command=source_command,
+            include_supplements=include_supplements,
         )
         website_summary = _write_website_ready_data(benchmark_output_dir)
     except Exception as exc:
@@ -700,10 +711,8 @@ def _run_compare_target(
     max_seq_len: int | None,
     max_output_tokens: int | None,
     output_dir: Path,
-    dataset_name: str = "default",
-    num_prompts: int | None = None,
-    input_len: int | None = None,
-    output_len: int | None = None,
+    execution_plan,
+    include_supplements_in_summary: bool,
 ) -> dict[str, object]:
     """Run a single live compare target and write per-target artifacts."""
     rows, summary = run_stream_compare_target(
@@ -715,11 +724,37 @@ def _run_compare_target(
         server_wait_s=server_wait_s,
         max_seq_len_override=max_seq_len,
         max_output_tokens_override=max_output_tokens,
-        dataset_name=dataset_name,
-        num_prompts=num_prompts,
-        input_len=input_len,
-        output_len=output_len,
+        scenarios=execution_plan.scenarios,
     )
+    mainline_rows = [
+        row for row in rows if str(row.get("scenario_source")) == MAINLINE_SCENARIO_SOURCE
+    ]
+    summary_mainline = {
+        **summary,
+        "total_rows": len(mainline_rows),
+        "avg_ttft_ms": sum(float(r.get("ttft_ms", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_tbt_ms": sum(float(r.get("tbt_ms", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_tpot_ms": sum(float(r.get("tpot_ms", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_itl_ms": sum(float(r.get("avg_itl_ms", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_e2el_ms": sum(float(r.get("avg_e2el_ms", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_throughput_tps": sum(float(r.get("throughput_tps", 0.0)) for r in mainline_rows)
+        / max(len(mainline_rows), 1),
+        "avg_output_throughput_tps": sum(
+            float(r.get("output_throughput_tps", r.get("throughput_tps", 0.0)))
+            for r in mainline_rows
+        )
+        / max(len(mainline_rows), 1),
+        "avg_request_throughput_rps": sum(
+            float(r.get("request_throughput_rps", 0.0)) for r in mainline_rows
+        )
+        / max(len(mainline_rows), 1),
+    }
+    summary_for_export = summary if include_supplements_in_summary else summary_mainline
     runtime_artifacts = _capture_target_runtime_artifacts(
         label=label,
         url=url,
@@ -744,8 +779,14 @@ def _run_compare_target(
         "models": [model],
         "batch_sizes": list(batch_sizes),
         "precisions": ["live"],
+        "workload_profile": execution_plan.profile.profile_id,
+        "supplements": list(execution_plan.supplements),
+        "dataset_name": execution_plan.profile.dataset_name,
+        "scenario_source": "mixed" if execution_plan.supplements else MAINLINE_SCENARIO_SOURCE,
         "runtime_artifacts": runtime_artifacts,
-        "summary": summary,
+        "summary": summary_for_export,
+        "summary_mainline": summary_mainline,
+        "summary_all": summary,
         "rows": rows,
     }
     parity_artifact = build_parity_run_artifact_from_e2e_payload(
@@ -768,13 +809,19 @@ def _run_compare_target(
         model=model,
         hardware_family=hardware_family,
         batch_sizes=list(batch_sizes),
-        summary=summary,
+        summary=summary_for_export,
         rows=rows,
         runtime_artifacts=runtime_artifacts,
         versions=collect_installed_versions(),
         artifacts={
             "raw_json": str(json_path),
             "markdown": str(md_path),
+        },
+        workload_context={
+            "workload_profile": execution_plan.profile.profile_id,
+            "supplements": list(execution_plan.supplements),
+            "dataset_name": execution_plan.profile.dataset_name,
+            "scenario_source": "mixed" if execution_plan.supplements else MAINLINE_SCENARIO_SOURCE,
         },
     )
     canonical_path = output_dir / f"{file_stem}.canonical.json"
@@ -790,7 +837,7 @@ def _run_compare_target(
     return {
         "label": label,
         "url": url,
-        "summary": summary,
+        "summary": summary_for_export,
         "json": str(json_path),
         "markdown": str(md_path),
         "canonical_json": str(canonical_path),
@@ -808,10 +855,25 @@ def _write_compare_summary_artifacts(
     target_results: list[dict[str, object]],
 ) -> dict[str, object]:
     """Write comparison summary artifacts from precomputed target results."""
+    workload_profile = "unknown"
+    supplements: list[str] = []
+    dataset_name = "unknown"
+    scenario_source = "mainline"
+    first_payload = target_results[0].get("payload") if target_results else None
+    if isinstance(first_payload, dict):
+        workload_profile = str(first_payload.get("workload_profile") or "unknown")
+        supplements = list(first_payload.get("supplements") or [])
+        dataset_name = str(first_payload.get("dataset_name") or "unknown")
+        scenario_source = str(first_payload.get("scenario_source") or "mainline")
+
     compare_result = {
         "kind": "compare",
         "model": model,
         "batch_sizes": batch_sizes,
+        "workload_profile": workload_profile,
+        "supplements": supplements,
+        "dataset_name": dataset_name,
+        "scenario_source": scenario_source,
         **_build_compare_summary(target_results),
     }
 
@@ -1456,10 +1518,13 @@ def _run_compare_command(
     max_output_tokens: int | None,
     output_dir: str | None,
     prompt_cleanup: bool | None,
-    dataset_name: str = "default",
+    profile: str,
+    supplements: tuple[str, ...],
+    dataset_path: str | None,
     num_prompts: int | None = None,
     input_len: int | None = None,
     output_len: int | None = None,
+    include_supplements_in_summary: bool = False,
     target_commands: dict[str, str] | None = None,
     header: str = "sageLLM Endpoint Compare",
     command_name: str = "compare",
@@ -1468,13 +1533,19 @@ def _run_compare_command(
     if len(targets) < 2:
         raise click.BadParameter("Repeat --target at least twice to compare multiple endpoints.")
 
-    _require_dataset_backed_stream_compare_args(
-        dataset_name=dataset_name,
-        num_prompts=num_prompts,
-        input_len=input_len,
-        output_len=output_len,
-        command_name=command_name,
-    )
+    try:
+        execution_plan = build_execution_plan(
+            profile_id=profile,
+            supplements=supplements,
+            dataset_path=dataset_path,
+            num_prompts=num_prompts,
+            input_len=input_len,
+            output_len=output_len,
+            batch_sizes=batch_sizes,
+            mode="live-compare",
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     parsed_targets = [_parse_compare_target(spec) for spec in targets]
     managed_processes = _maybe_start_local_targets(
@@ -1490,7 +1561,8 @@ def _run_compare_command(
     console.print(f"[bold cyan]{header}[/bold cyan]")
     console.print(f"Model: {model}")
     console.print(f"Targets: {len(parsed_targets)}")
-    console.print(f"Dataset: {dataset_name}")
+    console.print(f"Profile: {execution_plan.profile.profile_id}")
+    console.print(f"Supplements: {list(execution_plan.supplements)}")
     console.print(f"Output: {compare_output_dir}\n")
 
     target_results: list[dict[str, object]] = []
@@ -1509,10 +1581,8 @@ def _run_compare_command(
             max_seq_len=max_seq_len,
             max_output_tokens=max_output_tokens,
             output_dir=compare_output_dir,
-            dataset_name=dataset_name,
-            num_prompts=num_prompts,
-            input_len=input_len,
-            output_len=output_len,
+            execution_plan=execution_plan,
+            include_supplements_in_summary=include_supplements_in_summary,
         )
         target_results.append(target_result)
         summary = target_result["summary"]
@@ -1542,32 +1612,6 @@ def _run_compare_command(
         managed_processes=managed_processes,
     )
     return compare_output_dir
-
-
-def _require_dataset_backed_stream_compare_args(
-    *,
-    dataset_name: str,
-    num_prompts: int | None,
-    input_len: int | None,
-    output_len: int | None,
-    command_name: str,
-) -> None:
-    if dataset_name == "default":
-        return
-
-    missing: list[str] = []
-    if num_prompts is None:
-        missing.append("--num-prompts")
-    if input_len is None:
-        missing.append("--input-len")
-    if output_len is None:
-        missing.append("--output-len")
-
-    if missing:
-        raise click.ClickException(
-            f"{command_name} dataset-backed compare requires {' '.join(missing)}; "
-            "benchmark will not silently use default prompt counts or token lengths"
-        )
 
 
 def _resolve_local_benchmark_root() -> Path | None:
@@ -1663,7 +1707,7 @@ def create_output_directory(
     Args:
         backend: Backend name (cpu, cuda, vllm, etc.)
         model: Model name/path
-        workload: Workload type (m1, short, long, stress)
+        workload: Workload selector name.
         custom_path: User-specified output path (optional)
 
     Returns:
@@ -1798,7 +1842,7 @@ def collect_installed_versions() -> dict[str, str]:
 @click.group()
 @click.version_option(version="0.1.0", prog_name="sagellm-benchmark")
 def main() -> None:
-    """sageLLM Benchmark Suite - M1 Demo Contract Validation."""
+    """sageLLM Benchmark Suite CLI."""
     pass
 
 
@@ -2049,29 +2093,48 @@ def parity_gate_convert_core_telemetry(
     help="Hard cap on output tokens for each request.",
 )
 @click.option(
-    "--dataset-name",
-    type=click.Choice(["default", "random", "sharegpt"]),
-    default="default",
+    "--profile",
+    type=click.Choice(["vllm_random", "vllm_sharegpt", "vllm_hf", "vllm_custom"]),
+    default="vllm_random",
     show_default=True,
-    help="Prompt source for stream compare. 'default' keeps the built-in short/long scenarios.",
+    help="Workload profile id (vLLM-style dataset-driven mainline).",
+)
+@click.option(
+    "--supplement",
+    "supplements",
+    multiple=True,
+    type=click.Choice(["q1q8_supplement"]),
+    help="Optional supplement profile(s) to overlay on the mainline profile.",
+)
+@click.option(
+    "--dataset-path",
+    type=click.Path(),
+    default=None,
+    help="Dataset path for vllm_custom profile.",
+)
+@click.option(
+    "--leaderboard-include-supplements/--leaderboard-mainline-only",
+    default=False,
+    show_default=True,
+    help="Control whether leaderboard export aggregates supplement scenarios.",
 )
 @click.option(
     "--num-prompts",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--input-len",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--output-len",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--output-dir",
@@ -2090,7 +2153,10 @@ def compare_record(
     server_wait_s: float,
     max_seq_len: int | None,
     max_output_tokens: int | None,
-    dataset_name: str,
+    profile: str,
+    supplements: tuple[str, ...],
+    dataset_path: str | None,
+    leaderboard_include_supplements: bool,
     num_prompts: int | None,
     input_len: int | None,
     output_len: int | None,
@@ -2113,13 +2179,19 @@ def compare_record(
     console.print(f"Model: {model}")
     console.print(f"Output: {compare_output_dir}\n")
 
-    _require_dataset_backed_stream_compare_args(
-        dataset_name=dataset_name,
-        num_prompts=num_prompts,
-        input_len=input_len,
-        output_len=output_len,
-        command_name="compare-record",
-    )
+    try:
+        execution_plan = build_execution_plan(
+            profile_id=profile,
+            supplements=supplements,
+            dataset_path=dataset_path,
+            num_prompts=num_prompts,
+            input_len=input_len,
+            output_len=output_len,
+            batch_sizes=batch_sizes,
+            mode="live-compare",
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     target_result = _run_compare_target(
         label=label,
@@ -2133,10 +2205,8 @@ def compare_record(
         max_seq_len=max_seq_len,
         max_output_tokens=max_output_tokens,
         output_dir=compare_output_dir,
-        dataset_name=dataset_name,
-        num_prompts=num_prompts,
-        input_len=input_len,
-        output_len=output_len,
+        execution_plan=execution_plan,
+        include_supplements_in_summary=leaderboard_include_supplements,
     )
     summary = target_result["summary"]
 
@@ -2147,6 +2217,7 @@ def compare_record(
     _export_stream_leaderboard_artifacts(
         benchmark_output_dir=compare_output_dir,
         source_command="compare-record",
+        include_supplements=leaderboard_include_supplements,
     )
     console.print(f"JSON: {target_result['json']}")
     console.print(f"Markdown: {target_result['markdown']}")
@@ -2411,27 +2482,49 @@ def compare_offline(results: tuple[str, ...], output_dir: str | None) -> None:
 @_add_publish_options
 @main.command()
 @click.option(
-    "--workload",
-    type=click.Choice(
-        [
-            "all",
-            "query",
-            "Q1",
-            "Q2",
-            "Q3",
-            "Q4",
-            "Q5",
-            "Q6",
-            "Q7",
-            "Q8",
-            "streaming",
-            "batch",
-            "mixed",
-        ],
-        case_sensitive=False,
-    ),
-    default="all",
-    help="Workload type to run (Q1-Q8 query workloads, or 'all' for full suite).",
+    "--profile",
+    type=click.Choice(["vllm_random", "vllm_sharegpt", "vllm_hf", "vllm_custom"]),
+    default="vllm_random",
+    show_default=True,
+    help="Workload profile id (vLLM-style dataset-driven mainline).",
+)
+@click.option(
+    "--supplement",
+    "supplements",
+    multiple=True,
+    type=click.Choice(["q1q8_supplement"]),
+    help="Optional supplement profile(s) to overlay on the mainline profile.",
+)
+@click.option(
+    "--dataset-path",
+    type=click.Path(),
+    default=None,
+    help="Dataset path for vllm_custom profile.",
+)
+@click.option(
+    "--num-prompts",
+    type=int,
+    default=None,
+    help="Optional override for profile num_prompts; required by vllm_custom.",
+)
+@click.option(
+    "--input-len",
+    type=int,
+    default=None,
+    help="Optional override for profile input_len; required by vllm_custom.",
+)
+@click.option(
+    "--output-len",
+    type=int,
+    default=None,
+    help="Optional override for profile output_len; required by vllm_custom.",
+)
+@click.option(
+    "--batch-size",
+    "batch_sizes",
+    multiple=True,
+    type=int,
+    help="Optional override for profile batch sizes. Repeat for multiple values.",
 )
 @click.option(
     "--backend",
@@ -2473,28 +2566,20 @@ def compare_offline(results: tuple[str, ...], output_dir: str | None) -> None:
     is_flag=True,
     help="Enable verbose logging.",
 )
-@click.option(
-    "--dataset",
-    type=click.Choice(["default", "sharegpt", "synthetic"]),
-    default="default",
-    help="Dataset to use for prompts (default: hardcoded prompts, sharegpt: HuggingFace ShareGPT).",
-)
-@click.option(
-    "--num-samples",
-    type=int,
-    default=5,
-    help="Number of samples to use from dataset (ignored for 'default').",
-)
 def run(
-    workload: str,
+    profile: str,
+    supplements: tuple[str, ...],
+    dataset_path: str | None,
+    num_prompts: int | None,
+    input_len: int | None,
+    output_len: int | None,
+    batch_sizes: tuple[int, ...],
     backend: str,
     model: str | None,
     output: str,
     mode: str,
     output_json: str | None,
     verbose: bool,
-    dataset: str,
-    num_samples: int,
     publish: bool,
     publish_dry_run: bool,
     publish_hf_dataset: str,
@@ -2502,15 +2587,35 @@ def run(
     publish_hf_private: bool,
 ) -> None:
     """Run the canonical local workload benchmark pipeline."""
+    try:
+        execution_plan = build_execution_plan(
+            profile_id=profile,
+            supplements=supplements,
+            dataset_path=dataset_path,
+            num_prompts=num_prompts,
+            input_len=input_len,
+            output_len=output_len,
+            batch_sizes=batch_sizes if batch_sizes else None,
+            mode=mode,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     console.print("[bold cyan]sageLLM Benchmark[/bold cyan]")
-    console.print(f"Workload: {workload}")
+    console.print(f"Profile: {execution_plan.profile.profile_id}")
+    console.print(f"Supplements: {list(execution_plan.supplements)}")
     console.print(f"Backend: {backend}")
     console.print(f"Model: {model}")
-    console.print(f"Dataset: {dataset}")
+    console.print(f"Dataset: {execution_plan.profile.dataset_name}")
     console.print(f"Mode: {mode}")
 
     # Create hierarchical output directory
-    output_dir, metadata = create_output_directory(backend, model or "default", workload, output)
+    output_dir, metadata = create_output_directory(
+        backend,
+        model or "default",
+        execution_plan.profile.profile_id,
+        output,
+    )
     console.print(f"[bold green]Output:[/bold green] {output_dir}\n")
 
     # Import LLMEngine
@@ -2521,43 +2626,32 @@ def run(
         console.print("Install with: pip install isagellm-core")
         sys.exit(1)
 
-    # Determine workloads to run
-    from sagellm_benchmark.workloads import get_workloads_by_selector
+    from sagellm_benchmark.datasets import load_serving_dataset
+    from sagellm_benchmark.workloads import WorkloadConfig, WorkloadType
 
-    # Load dataset if needed
-    dataset_instance = None
-    if dataset == "sharegpt":
-        console.print("Loading ShareGPT dataset from HuggingFace...")
-        from sagellm_benchmark.datasets import ShareGPTDataset
+    serving_dataset_name, sharegpt_path = profile_to_serving_dataset(execution_plan.profile)
+    dataset_instance = load_serving_dataset(
+        serving_dataset_name,
+        seed=42,
+        sharegpt_path=sharegpt_path,
+    )
 
-        try:
-            dataset_instance = ShareGPTDataset.from_huggingface(
-                repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-                split="train[:1000]",  # Load first 1000 for speed
-                min_prompt_len=50,
-                max_prompt_len=5000,
-                seed=42,
-            )
-            console.print(f"✓ Loaded {len(dataset_instance)} prompts from ShareGPT")
-        except Exception as e:
-            raise click.ClickException(f"ShareGPT dataset load failed: {e}") from e
-    elif dataset == "synthetic":
-        console.print("Using synthetic ShareGPT-style prompts...")
-        from sagellm_benchmark.datasets import SyntheticShareGPTDataset
-
-        dataset_instance = SyntheticShareGPTDataset(seed=42)
-        console.print("✓ Synthetic dataset ready")
-
-    try:
-        workloads = get_workloads_by_selector(workload)
-    except ValueError:
-        console.print(f"[bold red]Unknown workload:[/bold red] {workload}")
-        sys.exit(1)
-
-    # Override num_requests if using dataset
-    if dataset_instance is not None:
-        for w in workloads:
-            w.num_requests = num_samples
+    workloads = [
+        WorkloadConfig(
+            name=scenario.scenario_name,
+            workload_type=WorkloadType.QUERY,
+            prompt=(
+                f"profile={scenario.workload_profile};source={scenario.scenario_source};"
+                f"scenario={scenario.scenario_name}"
+            ),
+            prompt_tokens=scenario.input_len,
+            max_tokens=scenario.output_len,
+            num_requests=scenario.num_prompts,
+            concurrent=scenario.batch_size > 1,
+            concurrency=scenario.batch_size,
+        )
+        for scenario in execution_plan.scenarios
+    ]
 
     # Create engine using LLMEngine
     if backend == "cpu":
@@ -2612,8 +2706,17 @@ def run(
     # Save run configuration
     run_metadata = dict(metadata)
     run_metadata["mode"] = mode
+    run_metadata["workload_profile"] = execution_plan.profile.profile_id
+    run_metadata["supplements"] = list(execution_plan.supplements)
+    run_metadata["scenario_source"] = MAINLINE_SCENARIO_SOURCE
     save_run_config(
-        output_dir, backend, model or "default", workload, dataset, num_samples, run_metadata
+        output_dir,
+        backend,
+        model or "default",
+        execution_plan.profile.profile_id,
+        execution_plan.profile.dataset_name,
+        execution_plan.profile.num_prompts,
+        run_metadata,
     )
 
     runner = BenchmarkRunner(bench_config)
@@ -3029,29 +3132,48 @@ def perf(
     help="Hard cap on output tokens for each request.",
 )
 @click.option(
-    "--dataset-name",
-    type=click.Choice(["default", "random", "sharegpt"]),
-    default="default",
+    "--profile",
+    type=click.Choice(["vllm_random", "vllm_sharegpt", "vllm_hf", "vllm_custom"]),
+    default="vllm_random",
     show_default=True,
-    help="Prompt source for stream compare. 'default' keeps the built-in short/long scenarios.",
+    help="Workload profile id (vLLM-style dataset-driven mainline).",
+)
+@click.option(
+    "--supplement",
+    "supplements",
+    multiple=True,
+    type=click.Choice(["q1q8_supplement"]),
+    help="Optional supplement profile(s) to overlay on the mainline profile.",
+)
+@click.option(
+    "--dataset-path",
+    type=click.Path(),
+    default=None,
+    help="Dataset path for vllm_custom profile.",
+)
+@click.option(
+    "--leaderboard-include-supplements/--leaderboard-mainline-only",
+    default=False,
+    show_default=True,
+    help="Control whether leaderboard export aggregates supplement scenarios.",
 )
 @click.option(
     "--num-prompts",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--input-len",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--output-len",
     type=int,
     default=None,
-    help="Required when --dataset-name is random or sharegpt.",
+    help="Optional profile override; required by vllm_custom.",
 )
 @click.option(
     "--output-dir",
@@ -3075,7 +3197,10 @@ def compare(
     server_wait_s: float,
     max_seq_len: int | None,
     max_output_tokens: int | None,
-    dataset_name: str,
+    profile: str,
+    supplements: tuple[str, ...],
+    dataset_path: str | None,
+    leaderboard_include_supplements: bool,
     num_prompts: int | None,
     input_len: int | None,
     output_len: int | None,
@@ -3102,10 +3227,13 @@ def compare(
             server_wait_s=server_wait_s,
             max_seq_len=max_seq_len,
             max_output_tokens=max_output_tokens,
-            dataset_name=dataset_name,
+            profile=profile,
+            supplements=supplements,
+            dataset_path=dataset_path,
             num_prompts=num_prompts,
             input_len=input_len,
             output_len=output_len,
+            include_supplements_in_summary=leaderboard_include_supplements,
             output_dir=output_dir,
             prompt_cleanup=prompt_cleanup,
             command_name="compare",
@@ -3116,6 +3244,7 @@ def compare(
     _prepare_compare_publish_ready_outputs(
         benchmark_output_dir=compare_output_dir,
         source_command="compare",
+        include_supplements=leaderboard_include_supplements,
     )
 
     if publish:

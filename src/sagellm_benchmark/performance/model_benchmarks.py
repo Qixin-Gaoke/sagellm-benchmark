@@ -67,8 +67,8 @@ def run_e2e_model_benchmarks(
     for batch_size in batch_sizes:
         scenarios.extend(
             [
-                Scenario(f"short_b{batch_size}", 128, 128, batch_size),
-                Scenario(f"long_b{batch_size}", 2048, 512, batch_size),
+                Scenario(f"vllm_random_b{batch_size}", 128, 128, batch_size),
+                Scenario(f"vllm_sharegpt_b{batch_size}", 256, 128, batch_size),
             ]
         )
 

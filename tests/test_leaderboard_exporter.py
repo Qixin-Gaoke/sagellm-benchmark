@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sagellm_benchmark.canonical_artifacts import (
     build_live_compare_artifact,
+    export_standard_leaderboard_artifacts,
     validate_canonical_artifact,
 )
 from sagellm_benchmark.exporters import LeaderboardExporter
@@ -320,7 +321,7 @@ def test_live_compare_canonical_and_leaderboard_keep_stream_metrics_compatible()
                 "model": "Qwen/Qwen2.5-0.5B-Instruct",
                 "effective_model": "Qwen/Qwen2.5-0.5B-Instruct",
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
@@ -345,6 +346,12 @@ def test_live_compare_canonical_and_leaderboard_keep_stream_metrics_compatible()
         ],
         runtime_artifacts={"info_json": "sagellm_info.json"},
         versions={"benchmark": "0.6.0.0", "sagellm": "0.6.0.0"},
+        workload_context={
+            "workload_profile": "vllm_random",
+            "supplements": [],
+            "dataset_name": "random",
+            "scenario_source": "mainline",
+        },
     )
     artifact["hardware"].update(
         {
@@ -402,3 +409,90 @@ def test_build_compare_snapshot_prefers_sagellm_vs_vllm_pair() -> None:
     assert round(pair["deltas"]["ttft_pct_left_vs_right"], 4) == -16.6667
     assert pair["winners"]["throughput"] == "left"
     assert pair["winners"]["ttft"] == "left"
+
+
+def test_export_standard_leaderboard_mainline_only_by_default(tmp_path: Path) -> None:
+    artifact = build_live_compare_artifact(
+        label="sagellm",
+        url="http://127.0.0.1:8901/v1",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        hardware_family="cuda",
+        batch_sizes=[1],
+        summary={
+            "total_rows": 2,
+            "avg_ttft_ms": 20.0,
+            "avg_tbt_ms": 4.0,
+            "avg_tpot_ms": 6.0,
+            "avg_itl_ms": 2.0,
+            "avg_e2el_ms": 40.0,
+            "avg_throughput_tps": 50.0,
+            "avg_output_throughput_tps": 50.0,
+            "avg_request_throughput_rps": 1.0,
+        },
+        rows=[
+            {
+                "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "effective_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "precision": "live",
+                "scenario": "vllm_random_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "tpot_ms": 3.0,
+                "avg_itl_ms": 1.0,
+                "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 2.0,
+                "avg_e2el_ms": 20.0,
+                "successful_requests": 1,
+                "failed_requests": 0,
+                "scenario_source": "mainline",
+                "workload_profile": "vllm_random",
+                "supplements": ["q1q8_supplement"],
+                "dataset_name": "random",
+            },
+            {
+                "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "effective_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "precision": "live",
+                "scenario": "q1_b1",
+                "batch_size": 1,
+                "ttft_ms": 30.0,
+                "tbt_ms": 6.0,
+                "tpot_ms": 9.0,
+                "avg_itl_ms": 3.0,
+                "throughput_tps": 20.0,
+                "output_throughput_tps": 20.0,
+                "request_throughput_rps": 0.5,
+                "avg_e2el_ms": 60.0,
+                "successful_requests": 1,
+                "failed_requests": 0,
+                "scenario_source": "supplement",
+                "workload_profile": "vllm_random",
+                "supplements": ["q1q8_supplement"],
+                "dataset_name": "random",
+            },
+        ],
+        runtime_artifacts={},
+        versions={"benchmark": "0.6.0.0", "sagellm": "0.6.0.0"},
+        workload_context={
+            "workload_profile": "vllm_random",
+            "supplements": ["q1q8_supplement"],
+            "dataset_name": "random",
+            "scenario_source": "mixed",
+        },
+    )
+    canonical_path = tmp_path / "sagellm.canonical.json"
+    canonical_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    export_standard_leaderboard_artifacts(tmp_path)
+    default_entry = json.loads((tmp_path / "sagellm_leaderboard.json").read_text(encoding="utf-8"))
+    assert default_entry["metrics"]["throughput_tps"] == 100.0
+
+    for path in (tmp_path / "leaderboard_manifest.json", tmp_path / "sagellm_leaderboard.json"):
+        if path.exists():
+            path.unlink()
+
+    export_standard_leaderboard_artifacts(tmp_path, include_supplements=True)
+    include_entry = json.loads((tmp_path / "sagellm_leaderboard.json").read_text(encoding="utf-8"))
+    assert include_entry["metrics"]["throughput_tps"] == 50.0

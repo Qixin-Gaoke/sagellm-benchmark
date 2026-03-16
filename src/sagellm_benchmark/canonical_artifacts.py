@@ -285,6 +285,7 @@ def build_live_compare_artifact(
     runtime_artifacts: dict[str, str] | None,
     versions: dict[str, Any] | None,
     artifacts: dict[str, Any] | None = None,
+    workload_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     precision = next(
         (
@@ -297,13 +298,30 @@ def build_live_compare_artifact(
     if precision.lower() == "live":
         precision = "FP16"
 
+    resolved_workload_context = dict(workload_context or {})
+    workload_profile = _require_text(
+        resolved_workload_context.get("workload_profile", ""),
+        "workload_profile",
+    )
+    dataset_name = _require_text(
+        resolved_workload_context.get("dataset_name", ""),
+        "dataset_name",
+    )
+    scenario_source = _require_text(
+        resolved_workload_context.get("scenario_source", ""),
+        "scenario_source",
+    )
+    supplements = resolved_workload_context.get("supplements")
+    if not isinstance(supplements, list):
+        raise ValueError("supplements is required for canonical benchmark artifacts")
+
     return _artifact_base(
         artifact_kind="execution_result",
         producer_command="compare",
         model=model,
         engine_name=label,
         hardware_family=hardware_family,
-        workload_name="compare-live",
+        workload_name=workload_profile,
         versions=versions,
         provenance={
             "captured_at": _utc_now_iso(),
@@ -320,6 +338,10 @@ def build_live_compare_artifact(
             "batch_sizes": list(batch_sizes),
             "mode": "live-compare",
             "precision": precision,
+            "workload_profile": workload_profile,
+            "supplements": supplements,
+            "dataset_name": dataset_name,
+            "scenario_source": scenario_source,
             "scenarios": sorted(
                 {
                     str(row.get("scenario"))
@@ -352,6 +374,13 @@ def build_compare_summary_artifact(
     versions: dict[str, Any] | None,
     artifacts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    workload_profile = _require_text(compare_result.get("workload_profile", ""), "workload_profile")
+    dataset_name = _require_text(compare_result.get("dataset_name", ""), "dataset_name")
+    scenario_source = _require_text(compare_result.get("scenario_source", ""), "scenario_source")
+    supplements = compare_result.get("supplements")
+    if not isinstance(supplements, list):
+        raise ValueError("supplements is required for compare summary canonical artifacts")
+
     return _artifact_base(
         artifact_kind="comparison_result",
         producer_command="compare",
@@ -370,6 +399,10 @@ def build_compare_summary_artifact(
         workload={
             "batch_sizes": list(batch_sizes),
             "target_labels": [str(target.get("label")) for target in target_results],
+            "workload_profile": workload_profile,
+            "supplements": supplements,
+            "dataset_name": dataset_name,
+            "scenario_source": scenario_source,
         },
         metrics={
             "target_count": len(target_results),
@@ -485,7 +518,81 @@ def collect_canonical_artifacts(
     return artifacts, errors
 
 
-def export_standard_leaderboard_artifacts(input_dir: Path | str) -> dict[str, Any]:
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _metrics_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ttft = [float(row.get("ttft_ms", 0.0)) for row in rows]
+    tbt = [float(row.get("tbt_ms", 0.0)) for row in rows]
+    tpot = [float(row.get("tpot_ms", 0.0)) for row in rows]
+    itl = [float(row.get("avg_itl_ms", 0.0)) for row in rows]
+    e2el = [float(row.get("avg_e2el_ms", 0.0)) for row in rows]
+    throughput = [float(row.get("throughput_tps", 0.0)) for row in rows]
+    output_throughput = [
+        float(row.get("output_throughput_tps", row.get("throughput_tps", 0.0))) for row in rows
+    ]
+    request_throughput = [float(row.get("request_throughput_rps", 0.0)) for row in rows]
+    success = sum(int(row.get("successful_requests", 0)) for row in rows)
+    failed = sum(int(row.get("failed_requests", 0)) for row in rows)
+    total = success + failed
+    return {
+        "ttft_ms": _mean(ttft),
+        "tbt_ms": _mean(tbt),
+        "tpot_ms": _mean(tpot),
+        "itl_ms": _mean(itl),
+        "e2el_ms": _mean(e2el),
+        "throughput_tps": _mean(throughput),
+        "output_throughput_tps": _mean(output_throughput),
+        "request_throughput_rps": _mean(request_throughput),
+        "peak_mem_mb": 0,
+        "error_rate": (failed / total) if total else 0.0,
+        "prefix_hit_rate": 0.0,
+        "kv_used_tokens": 0,
+        "kv_used_bytes": 0,
+        "evict_count": 0,
+        "evict_ms": 0.0,
+    }
+
+
+def _prepare_leaderboard_export_artifact(
+    artifact: dict[str, Any],
+    *,
+    include_supplements: bool,
+) -> dict[str, Any]:
+    if include_supplements:
+        return artifact
+
+    workload = artifact.get("workload") if isinstance(artifact.get("workload"), dict) else {}
+    supplements = workload.get("supplements") if isinstance(workload, dict) else []
+    if not supplements:
+        return artifact
+
+    measurements = (
+        artifact.get("measurements") if isinstance(artifact.get("measurements"), dict) else {}
+    )
+    rows = measurements.get("rows") if isinstance(measurements.get("rows"), list) else []
+    mainline_rows = [
+        row for row in rows if isinstance(row, dict) and row.get("scenario_source") == "mainline"
+    ]
+    if not mainline_rows:
+        raise ValueError("supplement export requires at least one mainline scenario row")
+
+    cloned = json.loads(json.dumps(artifact))
+    cloned["measurements"]["rows"] = mainline_rows
+    cloned["workload"]["supplements"] = []
+    cloned["workload"]["scenario_source"] = "mainline"
+    cloned["metrics"] = _metrics_from_rows(mainline_rows)
+    return cloned
+
+
+def export_standard_leaderboard_artifacts(
+    input_dir: Path | str,
+    *,
+    include_supplements: bool = False,
+) -> dict[str, Any]:
     input_path = Path(input_dir)
     artifacts, errors = collect_canonical_artifacts(input_path)
     if errors:
@@ -506,7 +613,14 @@ def export_standard_leaderboard_artifacts(input_dir: Path | str) -> dict[str, An
 
         file_stem = canonical_path.name.removesuffix(".canonical.json")
         leaderboard_path = canonical_path.with_name(f"{file_stem}_leaderboard.json")
-        leaderboard_entry = export_leaderboard_from_canonical_artifact(artifact, leaderboard_path)
+        export_artifact = _prepare_leaderboard_export_artifact(
+            artifact,
+            include_supplements=include_supplements,
+        )
+        leaderboard_entry = export_leaderboard_from_canonical_artifact(
+            export_artifact,
+            leaderboard_path,
+        )
         artifact.setdefault("artifacts", {})["leaderboard_json"] = str(leaderboard_path)
         write_canonical_artifact(canonical_path, artifact)
         LeaderboardExporter.register_exported_entry(

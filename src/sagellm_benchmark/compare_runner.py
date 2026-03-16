@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from sagellm_benchmark.clients.openai_client import GatewayClient
 from sagellm_benchmark.datasets import build_serving_requests
+from sagellm_benchmark.workload_profiles import WorkloadScenarioPlan
 
 if TYPE_CHECKING:
     from sagellm_benchmark.types import BenchmarkResult
@@ -28,6 +29,10 @@ class CompareScenario:
     prompt: str
     prompt_tokens: int
     output_tokens: int
+    scenario_source: str
+    workload_profile: str
+    supplements: tuple[str, ...]
+    dataset_name: str
 
 
 @dataclass(frozen=True)
@@ -232,6 +237,10 @@ def summarize_compare_row(
         "transport": transport,
         "successful_requests": len(successful),
         "failed_requests": len(failed),
+        "scenario_source": scenario.scenario_source,
+        "workload_profile": scenario.workload_profile,
+        "supplements": list(scenario.supplements),
+        "dataset_name": scenario.dataset_name,
     }
 
 
@@ -316,28 +325,14 @@ async def _run_stream_compare_target_async(
     server_wait_s: float,
     max_seq_len_override: int | None,
     max_output_tokens_override: int | None,
-    dataset_name: str = "default",
-    num_prompts: int | None = None,
-    input_len: int | None = None,
-    output_len: int | None = None,
+    scenarios: tuple[WorkloadScenarioPlan, ...],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the live stream compare transport and return canonical rows + summary."""
-    from sagellm_benchmark.performance.model_benchmarks import Scenario, _discover_max_seq_len
+    from sagellm_benchmark.performance.model_benchmarks import _discover_max_seq_len
     from sagellm_benchmark.types import BenchmarkRequest
 
-    scenarios: list[Scenario] = []
-    if dataset_name == "default":
-        for batch_size in batch_sizes:
-            scenarios.extend(
-                [
-                    Scenario(f"short_b{batch_size}", 128, 128, batch_size),
-                    Scenario(f"long_b{batch_size}", 2048, 512, batch_size),
-                ]
-            )
-    elif num_prompts is None or input_len is None or output_len is None:
-        raise ValueError(
-            "dataset-backed stream compare requires num_prompts, input_len, and output_len"
-        )
+    if not scenarios:
+        raise ValueError("compare scenarios are required")
 
     client = GatewayClient(
         base_url=backend_url,
@@ -368,83 +363,60 @@ async def _run_stream_compare_target_async(
                 backend_url=backend_url,
             )
 
-        if dataset_name == "default":
-            for scenario in scenarios:
-                effective_output_tokens = scenario.output_tokens
-                if (
-                    max_output_tokens_override is not None
-                    and effective_output_tokens > max_output_tokens_override
-                ):
-                    effective_output_tokens = max_output_tokens_override
-
-                effective_prompt_tokens = min(
-                    scenario.prompt_tokens,
-                    max(10, max_seq_len - effective_output_tokens - 10),
-                )
-                prompt = synthetic_prompt(effective_prompt_tokens)
-                requests = [
-                    BenchmarkRequest(
-                        prompt=prompt,
-                        max_tokens=effective_output_tokens,
-                        request_id=f"live-{scenario.name}-{index}",
-                        model=effective_model,
-                        stream=True,
-                    )
-                    for index in range(scenario.batch_size)
-                ]
-
-                started_at = time.perf_counter()
-                results = await client.generate_batch(requests, concurrent=True)
-                wall_time_s = max(time.perf_counter() - started_at, 1e-9)
-                compare_results = [result_from_benchmark_result(result) for result in results]
-                rows.append(
-                    summarize_compare_row(
-                        requested_model=model,
-                        effective_model=effective_model,
-                        scenario=CompareScenario(
-                            name=scenario.name,
-                            batch_size=scenario.batch_size,
-                            prompt=prompt,
-                            prompt_tokens=effective_prompt_tokens,
-                            output_tokens=effective_output_tokens,
-                        ),
-                        request_results=compare_results,
-                        wall_time_s=wall_time_s,
-                        mode="live",
-                        transport="stream",
-                    )
-                )
-        else:
-            effective_output_tokens = output_len
+        for scenario in scenarios:
+            effective_output_tokens = scenario.output_len
             if (
                 max_output_tokens_override is not None
                 and effective_output_tokens > max_output_tokens_override
             ):
                 effective_output_tokens = max_output_tokens_override
             effective_prompt_tokens = min(
-                input_len,
+                scenario.input_len,
                 max(10, max_seq_len - effective_output_tokens - 10),
             )
-            dataset_requests = build_serving_requests(
-                dataset_name=dataset_name,
-                num_prompts=num_prompts,
-                input_len=effective_prompt_tokens,
-                output_len=effective_output_tokens,
-                model=effective_model,
-                stream=True,
-                seed=0,
-            )
 
-            for batch_size in batch_sizes:
-                compare_results: list[CompareRequestResult] = []
+            if scenario.dataset_name == "random":
+                prompt = synthetic_prompt(effective_prompt_tokens)
+                requests = [
+                    BenchmarkRequest(
+                        prompt=prompt,
+                        max_tokens=effective_output_tokens,
+                        request_id=(f"live-{scenario.scenario_name}-{scenario.batch_size}-{index}"),
+                        model=effective_model,
+                        stream=True,
+                    )
+                    for index in range(scenario.batch_size)
+                ]
+                started_at = time.perf_counter()
+                results = await client.generate_batch(requests, concurrent=True)
+                wall_time_s = max(time.perf_counter() - started_at, 1e-9)
+                compare_results = [result_from_benchmark_result(result) for result in results]
+            else:
+                serving_dataset_name = "sharegpt"
+                sharegpt_path = scenario.dataset_path if scenario.dataset_name == "custom" else None
+                dataset_requests = build_serving_requests(
+                    dataset_name=serving_dataset_name,
+                    num_prompts=scenario.num_prompts,
+                    input_len=effective_prompt_tokens,
+                    output_len=effective_output_tokens,
+                    model=effective_model,
+                    stream=True,
+                    seed=0,
+                    sharegpt_path=sharegpt_path,
+                )
+
+                compare_results = []
                 wall_time_s = 0.0
-                for batch_start in range(0, len(dataset_requests), batch_size):
-                    batch = dataset_requests[batch_start : batch_start + batch_size]
+                for batch_start in range(0, len(dataset_requests), scenario.batch_size):
+                    batch = dataset_requests[batch_start : batch_start + scenario.batch_size]
                     requests = [
                         BenchmarkRequest(
                             prompt=request.prompt,
                             max_tokens=request.max_tokens,
-                            request_id=f"live-{dataset_name}-b{batch_size}-{batch_start + index}",
+                            request_id=(
+                                f"live-{scenario.scenario_name}-"
+                                f"b{scenario.batch_size}-{batch_start + index}"
+                            ),
                             model=effective_model,
                             stream=True,
                         )
@@ -457,23 +429,29 @@ async def _run_stream_compare_target_async(
                         result_from_benchmark_result(result) for result in results
                     )
 
-                rows.append(
-                    summarize_compare_row(
-                        requested_model=model,
-                        effective_model=effective_model,
-                        scenario=CompareScenario(
-                            name=f"{dataset_name}_b{batch_size}",
-                            batch_size=batch_size,
-                            prompt=f"dataset:{dataset_name}",
-                            prompt_tokens=effective_prompt_tokens,
-                            output_tokens=effective_output_tokens,
-                        ),
-                        request_results=compare_results,
-                        wall_time_s=max(wall_time_s, 1e-9),
-                        mode="live",
-                        transport="stream",
-                    )
+                prompt = f"dataset:{scenario.dataset_name}"
+
+            rows.append(
+                summarize_compare_row(
+                    requested_model=model,
+                    effective_model=effective_model,
+                    scenario=CompareScenario(
+                        name=scenario.scenario_name,
+                        batch_size=scenario.batch_size,
+                        prompt=prompt,
+                        prompt_tokens=effective_prompt_tokens,
+                        output_tokens=effective_output_tokens,
+                        scenario_source=scenario.scenario_source,
+                        workload_profile=scenario.workload_profile,
+                        supplements=scenario.supplements,
+                        dataset_name=scenario.dataset_name,
+                    ),
+                    request_results=compare_results,
+                    wall_time_s=max(wall_time_s, 1e-9),
+                    mode="live",
+                    transport="stream",
                 )
+            )
     finally:
         await client.close()
 
@@ -490,10 +468,7 @@ def run_stream_compare_target(
     server_wait_s: float,
     max_seq_len_override: int | None,
     max_output_tokens_override: int | None,
-    dataset_name: str = "default",
-    num_prompts: int | None = None,
-    input_len: int | None = None,
-    output_len: int | None = None,
+    scenarios: tuple[WorkloadScenarioPlan, ...],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synchronous wrapper for the shared stream compare transport."""
     return asyncio.run(
@@ -506,10 +481,7 @@ def run_stream_compare_target(
             server_wait_s=server_wait_s,
             max_seq_len_override=max_seq_len_override,
             max_output_tokens_override=max_output_tokens_override,
-            dataset_name=dataset_name,
-            num_prompts=num_prompts,
-            input_len=input_len,
-            output_len=output_len,
+            scenarios=scenarios,
         )
     )
 

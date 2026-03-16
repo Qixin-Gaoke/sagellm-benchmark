@@ -29,7 +29,7 @@ def _artifact(
     correctness_pass_rate: float = 1.0,
 ) -> ParityRunArtifact:
     scenarios = []
-    for batch_size, suffix in ((1, "short_b1"), (2, "short_b2"), (4, "short_b4")):
+    for batch_size, suffix in ((1, "vllm_random_b1"), (2, "vllm_random_b2"), (4, "vllm_random_b4")):
         scenarios.append(
             ParityScenarioMetrics(
                 scenario_name=suffix,
@@ -44,7 +44,7 @@ def _artifact(
         )
         scenarios.append(
             ParityScenarioMetrics(
-                scenario_name=f"long_b{batch_size}",
+                scenario_name=f"vllm_sharegpt_b{batch_size}",
                 batch_size=batch_size,
                 avg_tbt_ms=tbt,
                 output_throughput_tps=output_throughput,
@@ -196,7 +196,7 @@ def test_legacy_e2e_conversion_keeps_throughput_undistorted(tmp_path) -> None:
 
     artifact = load_parity_run_artifact(candidate_path)
 
-    assert artifact.scenarios[0].scenario_name == "short_b4"
+    assert artifact.scenarios[0].scenario_name == "vllm_random_b4"
     assert artifact.scenarios[0].output_throughput_tps == 111.0
     assert artifact.scenarios[0].fallback_rate is None
     assert artifact.scenarios[0].has_fallback_evidence is False
@@ -279,7 +279,7 @@ def test_build_parity_run_artifact_from_e2e_payload_succeeds() -> None:
             "url": "http://127.0.0.1:8901/v1",
             "rows": [
                 {
-                    "scenario": "short_b1",
+                    "scenario": "vllm_random_b1",
                     "batch_size": 1,
                     "tbt_ms": 2.0,
                     "output_throughput_tps": 100.0,
@@ -293,7 +293,7 @@ def test_build_parity_run_artifact_from_e2e_payload_succeeds() -> None:
 
     assert artifact.schema_version == "parity-run/v1"
     assert artifact.hardware_family == "cuda"
-    assert artifact.scenarios[0].scenario_name == "short_b1"
+    assert artifact.scenarios[0].scenario_name == "vllm_random_b1"
     assert artifact.scenarios[0].has_step_evidence is False
 
 
@@ -306,7 +306,7 @@ def test_build_parity_run_artifact_from_e2e_payload_fails_on_missing_field() -> 
                 "models": ["Qwen/Qwen2.5-0.5B-Instruct"],
                 "rows": [
                     {
-                        "scenario": "short_b1",
+                        "scenario": "vllm_random_b1",
                         "batch_size": 1,
                         "tbt_ms": 2.0,
                         "successful_requests": 1,
@@ -330,7 +330,7 @@ def test_load_parity_run_artifact_rejects_schema_mismatch(tmp_path) -> None:
                 "model": "Qwen/Qwen2.5-0.5B-Instruct",
                 "scenarios": [
                     {
-                        "scenario_name": "short_b1",
+                        "scenario_name": "vllm_random_b1",
                         "batch_size": 1,
                         "avg_tbt_ms": 2.0,
                     }

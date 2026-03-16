@@ -137,6 +137,18 @@ def build_parity_run_artifact_from_e2e_payload(
         )
         for row in rows
     ]
+    scenario_groups = {
+        "mainline": sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and str(row.get("scenario_source")) == "mainline"
+        ),
+        "supplement": sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and str(row.get("scenario_source")) == "supplement"
+        ),
+    }
 
     return ParityRunArtifact(
         label=label,
@@ -148,6 +160,7 @@ def build_parity_run_artifact_from_e2e_payload(
             "source_kind": payload.get("kind"),
             "source_mode": payload.get("mode"),
             "source_url": payload.get("url"),
+            "scenario_groups": scenario_groups,
             "generated_by": "sagellm-benchmark live compare",
         },
     )
@@ -158,7 +171,7 @@ def build_default_cuda_decode_gate() -> DecodeParityGate:
     for batch_size in (1, 2, 4):
         scenarios.append(
             DecodeParityScenario(
-                name=f"short_b{batch_size}",
+                name=f"vllm_random_b{batch_size}",
                 prompt_tokens=128,
                 output_tokens=128,
                 batch_size=batch_size,
@@ -166,9 +179,9 @@ def build_default_cuda_decode_gate() -> DecodeParityGate:
         )
         scenarios.append(
             DecodeParityScenario(
-                name=f"long_b{batch_size}",
-                prompt_tokens=2048,
-                output_tokens=512,
+                name=f"vllm_sharegpt_b{batch_size}",
+                prompt_tokens=256,
+                output_tokens=128,
                 batch_size=batch_size,
             )
         )
@@ -433,6 +446,10 @@ def _build_parity_scenario_metrics_from_e2e_row(
 
     batch_size = int(row["batch_size"])
     scenario = str(row["scenario"])
+    if scenario == "short":
+        scenario = "vllm_random"
+    elif scenario == "long":
+        scenario = "vllm_sharegpt"
     scenario_name = scenario if "_b" in scenario else f"{scenario}_b{batch_size}"
 
     output_throughput = row.get("output_throughput_tps")

@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sagellm_benchmark.workloads import M1_WORKLOADS, TPCH_WORKLOADS
+from sagellm_benchmark.workloads import TPCH_WORKLOADS
 
 if TYPE_CHECKING:
     from sagellm_benchmark.types import AggregatedMetrics
@@ -26,8 +26,36 @@ WORKLOAD_SPECS = {
         "concurrent_requests": workload.concurrency
         or (workload.num_requests if workload.concurrent else 1),
     }
-    for workload in [*TPCH_WORKLOADS, *M1_WORKLOADS]
+    for workload in TPCH_WORKLOADS
 }
+WORKLOAD_SPECS.update(
+    {
+        "vllm_random": {
+            "input_length": 128,
+            "output_length": 128,
+            "batch_size": None,
+            "concurrent_requests": None,
+        },
+        "vllm_sharegpt": {
+            "input_length": 256,
+            "output_length": 128,
+            "batch_size": None,
+            "concurrent_requests": None,
+        },
+        "vllm_hf": {
+            "input_length": 256,
+            "output_length": 128,
+            "batch_size": None,
+            "concurrent_requests": None,
+        },
+        "vllm_custom": {
+            "input_length": 128,
+            "output_length": 128,
+            "batch_size": None,
+            "concurrent_requests": None,
+        },
+    }
+)
 
 LEADERBOARD_ENTRY_SCHEMA_VERSION = "leaderboard-export-entry/v2"
 LEADERBOARD_MANIFEST_SCHEMA_VERSION = "leaderboard-export-manifest/v2"
@@ -1000,7 +1028,12 @@ class LeaderboardExporter:
         cmd_model = model_info["name"]
         cmd_workload = workload_info.get("name") or "unknown"
         if producer.get("command") == "run":
-            reproducible_cmd = f"sagellm-benchmark run --workload {cmd_workload} --backend {engine_payload.get('backend', engine)} --model {cmd_model}"
+            reproducible_cmd = (
+                "sagellm-benchmark run "
+                f"--profile {cmd_workload} "
+                f"--backend {engine_payload.get('backend', engine)} "
+                f"--model {cmd_model}"
+            )
         elif producer.get("command") == "compare":
             reproducible_cmd = f"sagellm-benchmark compare --target {engine}={provenance.get('endpoint_url', '')} --model {cmd_model} --hardware-family {hardware.get('family', 'unknown')}"
         else:

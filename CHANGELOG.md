@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 新增 profile-first workload 语义层：`vllm_random` / `vllm_sharegpt` / `vllm_hf` / `vllm_custom` 与统一字段（`workload_profile`、`dataset_name`、`supplements`、`scenario_source`）。
+- 新增 `q1q8_supplement`，以 supplement 方式叠加到 mainline profile，不再作为独立平行入口。
+- `comparison.json` 与 canonical/parity 产物新增可追溯字段：`workload_profile`、`supplements`、`scenario_source`、`dataset_name`。
 - `publish` / `compare --publish` 现在会额外生成 `leaderboard_compare.json` website compare snapshot：它仍然只由 canonical `execution_result -> *_leaderboard.json -> leaderboard_manifest.json` 主链路派生，不引入第二套结果主 schema，但允许 website 直接展示 `sageLLM vs vLLM` / `vLLM-Ascend` 的 head-to-head 性能差距。
 - 新增面向 OpenAI-compatible `/v1/chat/completions` 主路径的独立 SSE 流式 benchmark 模块：可直接采集 TTFT、ITL、TPOT、E2EL、输出 token 数与成功/失败状态，并把结果映射到现有 `BenchmarkResult` / `AggregatedMetrics`；`/v1/completions` 仅保留兼容支持，不扩展为主链路。
 - 明确 benchmark 当前入口职责与兼容层边界：`run`/`compare` 为唯一推荐主链路，`vllm-compare` 仅保留安装等 setup helper，`run_benchmark.sh` 的 `quick`/`convergence` 为兼容 shell wrapper；相关 CLI 和文档现在都会显式提示该边界。
@@ -16,11 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README 与 QUICKSTART 现补充流式 serving benchmark、dataset 驱动压测、以及 `request_rate` / `burstiness` / `ramp_up` traffic API 的用法说明，并明确 `compare` 是唯一推荐的跨引擎入口，`vllm-compare` 仅保留 setup helper。
 
 ### Fixed
+- 删除 `workloads.py` 中已弃用的 `m1/year1/short/long/stress` selector 兼容分支；`test_workloads.py` 不再触发对应的 `DeprecationWarning`，示例与 leaderboard 导出也同步迁移到正式 workload 入口。
 - pytest 现在会在 `tests/conftest.py` 启动最早阶段默认设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，避免 Ascend 主机直接执行 benchmark 测试时被 `torch` 隐式自动加载 `torch_npu` 卡住。
 - compare 主链路的 chat streaming 请求体现在默认只发送 `model`、`messages`、`max_tokens` 和 `stream`；不再默认附带 `stream_options.include_usage`、`temperature` 或 `top_p`，并且指标统计优先依赖本地时序与本地 token 计数而不是 endpoint usage chunk。
 - `sync_results_to_website.sh` 与 website 离线聚合主链现在会同步 `leaderboard_compare.json`，不再只更新 single/multi snapshots 后让前端临时自行拼接所有 head-to-head gap。
 
 ### Changed
+- `run`/`compare`/`compare-record` 统一收敛到同一 profile 解析与场景构造流水线。
+- leaderboard 导出默认仅聚合 mainline 场景；可通过 `--leaderboard-include-supplements` 显式包含 supplements。
+
+### Removed
+- 移除 short/long 命名体系及 `short_b*`/`long_b*` 场景命名。
+- 移除 `run --workload` 与 `compare --dataset-name` 等旧入口（破坏性变更）。
 - Hugging Face dataset 发布链路现统一收口到标准 `publish` 主链：仅接受 `leaderboard_manifest.json` + `*_leaderboard.json` 标准导出输入，`upload-hf` 降级为兼容包装；publish 本身不再混入 website sync，且对缺失 token / dataset / manifest / 标准 snapshot 集合的情况统一 fail-fast。
 - leaderboard/export 边界现收紧为仅接受 `canonical-benchmark-result/v2` 的 live-compare `execution_result` 工件；`leaderboard-export-entry/v2` 与 `leaderboard-export-manifest/v2` 成为唯一导出 schema，旧字段别名、旧 schema 复用、以及从本地 `run` 口径自动兜底导出 leaderboard 的路径已删除。
 - `perf` 与 `compare` 的职责边界进一步收紧：`perf --live` 现在明确只面向单 endpoint 的 operator/e2e 采集，并在传入多个 `--model` 时 fail-fast；跨引擎 live benchmark 统一收口到 `compare`。
@@ -200,7 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `upload-hf` 支持与远端 canonical 文件比较，远端更新时跳过上传，防止旧结果覆盖新结果
 - `GatewayClient.health_check()`：从 OpenAI SDK `models.list()`（会 404/hang）改为先试 `/health`，再试 `/v1/models`，均使用 httpx 带超时
 - `GatewayClient` 新增 `discover_model()` 方法：通过 `/info` 或 `/v1/models` 获取服务器实际加载的模型名称
-- live 模式 prompt/output token 数 clamp 修复 `IndexError: index out of range in self`（短上下文模型如 sshleifer/tiny-gpt2 位置编码上限 1024，long_b1 scenario 默认 2048 prompt tokens 越界）
+- live 模式 prompt/output token 数 clamp 修复 `IndexError: index out of range in self`（短上下文模型如 sshleifer/tiny-gpt2 位置编码上限 1024，vllm_sharegpt_b1 scenario 默认 2048 prompt tokens 越界）
 
 ## [0.5.1.2] - 2025-07-25
 

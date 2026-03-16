@@ -24,6 +24,7 @@ from sagellm_benchmark.nonstream_compare import (
     run_nonstream_compare,
 )
 from sagellm_benchmark.types import AggregatedMetrics, BenchmarkResult
+from sagellm_benchmark.workload_profiles import WorkloadScenarioPlan
 
 
 def test_perf_help():
@@ -123,6 +124,20 @@ def test_stream_compare_runner_uses_chat_streaming_client_only(monkeypatch) -> N
         server_wait_s=1.0,
         max_seq_len_override=512,
         max_output_tokens_override=32,
+        scenarios=(
+            WorkloadScenarioPlan(
+                scenario_name="vllm_random_b1",
+                scenario_source="mainline",
+                dataset_name="random",
+                dataset_path="builtin://random",
+                num_prompts=1,
+                input_len=128,
+                output_len=32,
+                batch_size=1,
+                workload_profile="vllm_random",
+                supplements=(),
+            ),
+        ),
     )
 
     assert captured_endpoint_types == ["chat"], (
@@ -211,7 +226,7 @@ def test_compare_generates_files(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": ttft,
                 "tbt_ms": tbt,
@@ -228,6 +243,10 @@ def test_compare_generates_files(monkeypatch):
                 "transport": "stream",
                 "successful_requests": 1,
                 "failed_requests": 0,
+                "scenario_source": "mainline",
+                "workload_profile": "vllm_random",
+                "supplements": [],
+                "dataset_name": "random",
             }
         ]
         return rows, {
@@ -304,6 +323,9 @@ def test_compare_generates_files(monkeypatch):
             canonical_payload = json.load(f)
         assert canonical_payload["schema_version"] == "canonical-benchmark-result/v2"
         assert canonical_payload["artifact_kind"] == "execution_result"
+        assert canonical_payload["workload"]["workload_profile"] == "vllm_random"
+        assert canonical_payload["workload"]["scenario_source"] == "mainline"
+        assert canonical_payload["workload"]["dataset_name"] == "random"
         assert canonical_payload["artifacts"]["leaderboard_json"].endswith(
             "sagellm_leaderboard.json"
         )
@@ -319,6 +341,10 @@ def test_compare_generates_files(monkeypatch):
             payload = json.load(f)
         assert payload["kind"] == "compare"
         assert payload["baseline"] == "sagellm"
+        assert payload["workload_profile"] == "vllm_random"
+        assert payload["supplements"] == []
+        assert payload["dataset_name"] == "random"
+        assert payload["scenario_source"] == "mainline"
         assert len(payload["targets"]) == 2
         assert json.loads((output_dir / "sagellm.json").read_text())["transport"] == "stream"
         manifest = json.loads((output_dir / "leaderboard_manifest.json").read_text())
@@ -331,7 +357,7 @@ def test_compare_generates_files(monkeypatch):
         assert compare_snapshot["group_count"] >= 1
 
 
-def test_compare_forwards_dataset_backed_stream_options(monkeypatch):
+def test_compare_forwards_profile_scenarios(monkeypatch):
     captured_kwargs: list[dict[str, object]] = []
 
     def fake_run_stream_compare_target(**kwargs):
@@ -402,8 +428,8 @@ def test_compare_forwards_dataset_backed_stream_options(monkeypatch):
                 "Qwen/Qwen2.5-0.5B-Instruct",
                 "--hardware-family",
                 "cuda",
-                "--dataset-name",
-                "random",
+                "--profile",
+                "vllm_random",
                 "--num-prompts",
                 "6",
                 "--input-len",
@@ -417,13 +443,16 @@ def test_compare_forwards_dataset_backed_stream_options(monkeypatch):
 
     assert result.exit_code == 0
     assert len(captured_kwargs) == 2
-    assert all(kwargs["dataset_name"] == "random" for kwargs in captured_kwargs)
-    assert all(kwargs["num_prompts"] == 6 for kwargs in captured_kwargs)
-    assert all(kwargs["input_len"] == 512 for kwargs in captured_kwargs)
-    assert all(kwargs["output_len"] == 48 for kwargs in captured_kwargs)
+    assert all("scenarios" in kwargs for kwargs in captured_kwargs)
+    assert all(
+        kwargs["scenarios"][0].workload_profile == "vllm_random" for kwargs in captured_kwargs
+    )
+    assert all(kwargs["scenarios"][0].num_prompts == 6 for kwargs in captured_kwargs)
+    assert all(kwargs["scenarios"][0].input_len == 512 for kwargs in captured_kwargs)
+    assert all(kwargs["scenarios"][0].output_len == 48 for kwargs in captured_kwargs)
 
 
-def test_compare_record_forwards_dataset_backed_stream_options(monkeypatch):
+def test_compare_record_forwards_profile_scenarios(monkeypatch):
     captured_kwargs: list[dict[str, object]] = []
 
     def fake_run_stream_compare_target(**kwargs):
@@ -493,8 +522,8 @@ def test_compare_record_forwards_dataset_backed_stream_options(monkeypatch):
                 "cuda",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
-                "--dataset-name",
-                "sharegpt",
+                "--profile",
+                "vllm_sharegpt",
                 "--num-prompts",
                 "5",
                 "--input-len",
@@ -508,10 +537,10 @@ def test_compare_record_forwards_dataset_backed_stream_options(monkeypatch):
 
     assert result.exit_code == 0
     assert len(captured_kwargs) == 1
-    assert captured_kwargs[0]["dataset_name"] == "sharegpt"
-    assert captured_kwargs[0]["num_prompts"] == 5
-    assert captured_kwargs[0]["input_len"] == 256
-    assert captured_kwargs[0]["output_len"] == 32
+    assert captured_kwargs[0]["scenarios"][0].workload_profile == "vllm_sharegpt"
+    assert captured_kwargs[0]["scenarios"][0].num_prompts == 5
+    assert captured_kwargs[0]["scenarios"][0].input_len == 256
+    assert captured_kwargs[0]["scenarios"][0].output_len == 32
 
 
 def test_parity_gate_convert_core_telemetry_writes_normalized_artifact() -> None:
@@ -755,7 +784,7 @@ def test_compare_record_and_compare_offline_preserve_stream_metrics(monkeypatch)
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": ttft,
                 "tbt_ms": tbt,
@@ -776,6 +805,10 @@ def test_compare_record_and_compare_offline_preserve_stream_metrics(monkeypatch)
                 "transport": "stream",
                 "successful_requests": 1,
                 "failed_requests": 0,
+                "scenario_source": "mainline",
+                "workload_profile": "vllm_random",
+                "supplements": [],
+                "dataset_name": "random",
             }
         ]
         return rows, {
@@ -957,7 +990,7 @@ def test_compare_record_generates_files(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
@@ -1045,7 +1078,7 @@ def test_compare_record_auto_captures_core_telemetry_artifact(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
@@ -1365,7 +1398,7 @@ def test_compare_auto_captures_runtime_artifacts(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
@@ -1599,7 +1632,7 @@ def test_compare_prompt_cleanup_kills_local_targets(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
@@ -1701,7 +1734,7 @@ def test_compare_prompt_cleanup_can_leave_targets_running(monkeypatch):
                 "model": kwargs["model"],
                 "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
