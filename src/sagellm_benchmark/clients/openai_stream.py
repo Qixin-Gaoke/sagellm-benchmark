@@ -134,6 +134,17 @@ class OpenAIStreamBenchmarker:
 
         completed_at = self._time_fn()
         output_text = "".join(output_parts)
+        if content_events == 0:
+            return BenchmarkResult(
+                request_id=request.request_id,
+                success=False,
+                error=(
+                    "stream completed without content delta tokens; "
+                    "refusing to emit zero-latency benchmark metrics"
+                ),
+                metrics=None,
+            )
+
         output_tokens = self._count_text_tokens(output_text, request.model)
         if output_tokens <= 0:
             output_tokens = usage_output_tokens

@@ -726,6 +726,13 @@ def _run_compare_target(
         max_output_tokens_override=max_output_tokens,
         scenarios=execution_plan.scenarios,
     )
+    total_successful_requests = sum(int(row.get("successful_requests", 0)) for row in rows)
+    if total_successful_requests <= 0:
+        raise click.ClickException(
+            "benchmark failure: compare target "
+            f"'{label}' returned zero successful streaming completions"
+        )
+
     mainline_rows = [
         row for row in rows if str(row.get("scenario_source")) == MAINLINE_SCENARIO_SOURCE
     ]

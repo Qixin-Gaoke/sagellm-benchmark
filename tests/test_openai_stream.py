@@ -140,6 +140,33 @@ async def test_chat_stream_ignores_empty_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_fails_fast_when_no_content_tokens() -> None:
+    response = _FakeResponse(
+        status_code=200,
+        chunks=[
+            b'data: {"choices":[{"delta":{"role":"assistant","content":null},"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"delta":{"role":null,"content":null},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+    )
+    client = _FakeHTTPClient(response)
+
+    bench = OpenAIStreamBenchmarker(
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="token",
+        http_client=client,
+        token_counter=lambda text, model: len(text),
+    )
+
+    result = await bench.benchmark(_request())
+
+    assert result.success is False
+    assert result.metrics is None
+    assert result.error is not None
+    assert "stream completed without content delta tokens" in result.error
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_uses_minimal_payload_without_usage_dependency() -> None:
     response = _FakeResponse(
         status_code=200,
