@@ -7,6 +7,7 @@ to benchmark collection rather than CLI orchestration.
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import json
 import logging
@@ -38,6 +39,7 @@ class OpenAIStreamBenchmarker:
         time_fn: Callable[[], float] | None = None,
         token_counter: Callable[[str, str], int] | None = None,
         zero_content_retry_attempts: int = 0,
+        zero_content_retry_backoff_sec: float = 0.05,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -47,6 +49,7 @@ class OpenAIStreamBenchmarker:
         self._time_fn = time_fn or time.perf_counter
         self._token_counter = token_counter
         self._zero_content_retry_attempts = max(int(zero_content_retry_attempts), 0)
+        self._zero_content_retry_backoff_sec = max(float(zero_content_retry_backoff_sec), 0.0)
         self._validate_endpoint_type()
 
     @staticmethod
@@ -141,12 +144,15 @@ class OpenAIStreamBenchmarker:
             output_text = "".join(output_parts)
             if content_events == 0:
                 if attempt < self._zero_content_retry_attempts:
-                    logger.warning(
+                    logger.info(
                         "Streaming request %s produced no content delta tokens on attempt %d/%d; retrying",
                         request.request_id,
                         attempt + 1,
                         self._zero_content_retry_attempts + 1,
                     )
+                    if self._zero_content_retry_backoff_sec > 0:
+                        # Short async backoff helps absorb transient EOS-first empty streams.
+                        await asyncio.sleep(self._zero_content_retry_backoff_sec * (attempt + 1))
                     continue
                 return BenchmarkResult(
                     request_id=request.request_id,
