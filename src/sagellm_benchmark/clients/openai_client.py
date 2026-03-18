@@ -63,6 +63,7 @@ class GatewayClient(BenchmarkClient):
         endpoint_type: str = "chat",
         http_client: Any | None = None,
         time_fn: Callable[[], float] | None = None,
+        zero_content_retry_attempts: int | None = None,
     ) -> None:
         """Initialize Gateway client.
 
@@ -97,6 +98,16 @@ class GatewayClient(BenchmarkClient):
         self._owns_http_client = http_client is None
         self._http_client = http_client or httpx.AsyncClient(timeout=timeout)
         self._tokenizer_cache: dict[str, Any | None] = {}
+        if zero_content_retry_attempts is None:
+            zero_content_retry_attempts = int(
+                os.getenv("SAGELLM_BENCHMARK_STREAM_ZERO_CONTENT_RETRIES", "1")
+            )
+        if zero_content_retry_attempts < 0:
+            logger.warning(
+                "Received negative zero_content_retry_attempts=%s; clamping to 0",
+                zero_content_retry_attempts,
+            )
+            zero_content_retry_attempts = 0
         self._stream_benchmarker = OpenAIStreamBenchmarker(
             base_url=base_url,
             api_key=api_key,
@@ -105,6 +116,7 @@ class GatewayClient(BenchmarkClient):
             http_client=self._http_client,
             time_fn=time_fn,
             token_counter=self._count_text_tokens,
+            zero_content_retry_attempts=zero_content_retry_attempts,
         )
 
         logger.info(

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README 与 QUICKSTART 现补充流式 serving benchmark、dataset 驱动压测、以及 `request_rate` / `burstiness` / `ramp_up` traffic API 的用法说明，并明确 `compare` 是唯一推荐的跨引擎入口，`vllm-compare` 仅保留 setup helper。
 
 ### Fixed
+- `GatewayClient` 的 chat-stream benchmark 现对“无 content delta token 即结束”的随机流事件增加可配置重试（默认 1 次，可通过 `SAGELLM_BENCHMARK_STREAM_ZERO_CONTENT_RETRIES` 覆盖），以减少官方 `vllm_random` 场景下 `b2/b4` 的偶发 1/1 失败抖动，同时保持 strict minimal payload 与 `/v1/chat/completions` 主路径边界不变。
 - 删除 `workloads.py` 中已弃用的 `m1/year1/short/long/stress` selector 兼容分支；`test_workloads.py` 不再触发对应的 `DeprecationWarning`，示例与 leaderboard 导出也同步迁移到正式 workload 入口。
 - pytest 现在会在 `tests/conftest.py` 启动最早阶段默认设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，避免 Ascend 主机直接执行 benchmark 测试时被 `torch` 隐式自动加载 `torch_npu` 卡住。
 - compare 主链路的 chat streaming 请求体现在默认只发送 `model`、`messages`、`max_tokens` 和 `stream`；不再默认附带 `stream_options.include_usage`、`temperature` 或 `top_p`，并且指标统计优先依赖本地时序与本地 token 计数而不是 endpoint usage chunk。

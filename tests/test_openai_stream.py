@@ -53,6 +53,24 @@ class _FakeHTTPClient:
         return None
 
 
+class _SequentialHTTPClient:
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, object]] = []
+        self._index = 0
+
+    def stream(self, method: str, url: str, **kwargs) -> _FakeStreamContext:
+        if self._index >= len(self._responses):
+            raise RuntimeError("no more fake responses configured")
+        response = self._responses[self._index]
+        self._index += 1
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return _FakeStreamContext(response)
+
+    async def aclose(self) -> None:
+        return None
+
+
 def _request() -> BenchmarkRequest:
     return BenchmarkRequest(
         prompt="Hello benchmark",
@@ -164,6 +182,42 @@ async def test_chat_stream_fails_fast_when_no_content_tokens() -> None:
     assert result.metrics is None
     assert result.error is not None
     assert "stream completed without content delta tokens" in result.error
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_retries_once_after_empty_content_stream() -> None:
+    empty_response = _FakeResponse(
+        status_code=200,
+        chunks=[
+            b'data: {"choices":[{"delta":{"role":"assistant","content":null},"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"delta":{"role":null,"content":null},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+    )
+    content_response = _FakeResponse(
+        status_code=200,
+        chunks=[
+            b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+    )
+    client = _SequentialHTTPClient([empty_response, content_response])
+    clock = iter([40.0, 40.05, 40.08, 40.10, 40.12])
+
+    bench = OpenAIStreamBenchmarker(
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="token",
+        http_client=client,
+        time_fn=lambda: next(clock),
+        token_counter=lambda text, model: len(text),
+        zero_content_retry_attempts=1,
+    )
+
+    result = await bench.benchmark(_request())
+
+    assert result.success is True
+    assert result.output_text == "Hi"
+    assert len(client.calls) == 2
 
 
 @pytest.mark.asyncio
