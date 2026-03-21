@@ -83,9 +83,9 @@ def _request() -> BenchmarkRequest:
 @pytest.mark.asyncio
 async def test_chat_stream_handles_fragmented_sse_and_usage_chunk() -> None:
     stream_bytes = (
-        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+        b'data: {"event":"start","trace_id":"trace-stream-001","choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        b'data: {"event":"delta","trace_id":"trace-stream-001","choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        b'data: {"event":"delta","trace_id":"trace-stream-001","choices":[{"delta":{"content":"lo"}}]}\n\n'
         b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}\n\n'
         b"data: [DONE]\n\n"
     )
@@ -117,6 +117,8 @@ async def test_chat_stream_handles_fragmented_sse_and_usage_chunk() -> None:
     assert result.metrics.tbt_ms == pytest.approx(30.0)
     assert result.metrics.tpot_ms == pytest.approx(17.5)
     assert result.metrics.itl_list == pytest.approx([30.0])
+    assert result.trace_id == "trace-stream-001"
+    assert result.protocol_surface == "chat_mainline"
 
     aggregated = MetricsAggregator.aggregate([result])
     assert aggregated.avg_ttft_ms == pytest.approx(50.0)
@@ -263,6 +265,33 @@ async def test_chat_stream_uses_minimal_payload_without_usage_dependency() -> No
         "stream": True,
         "messages": [{"role": "user", "content": "Hello benchmark"}],
     }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_fails_fast_on_explicit_error_event() -> None:
+    response = _FakeResponse(
+        status_code=200,
+        chunks=[
+            b'data: {"event":"start","trace_id":"trace-stream-error","choices":[{"delta":{"role":"assistant"}}]}\n\n',
+            b'data: {"event":"error","trace_id":"trace-stream-error","error":{"message":"gateway upstream failed","code":"unavailable"},"choices":[{"delta":{},"finish_reason":"error"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+    )
+    client = _FakeHTTPClient(response)
+
+    bench = OpenAIStreamBenchmarker(
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="token",
+        http_client=client,
+        token_counter=lambda text, model: len(text),
+    )
+
+    result = await bench.benchmark(_request())
+
+    assert result.success is False
+    assert result.error == "gateway upstream failed"
+    assert result.error_code == "unavailable"
+    assert result.trace_id == "trace-stream-error"
 
 
 @pytest.mark.asyncio

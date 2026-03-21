@@ -113,6 +113,9 @@ class BenchmarkResult:
     # 新增：benchmark 层面的延迟记录
     itl_list: list[float] = field(default_factory=list)  # 逐 token 延迟（ms）
     e2e_latency_ms: float = 0.0  # 端到端延迟（从发送到完成）
+    trace_id: str | None = None
+    error_code: str | None = None
+    protocol_surface: str | None = None
     is_warmup: bool = False
     batch_total_time_s: float = 0.0
 

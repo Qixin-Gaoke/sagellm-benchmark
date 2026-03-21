@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 新增 `compatibility_matrix.py` 兼容性门禁模块：可对协议版本协商、错误码分布、以及 stream/non-stream 一致性执行结构化判定，并输出 `compatibility_pass_rate`、`version_mismatch_total` 与 `error_code_distribution`，为发布前回归矩阵提供统一结果格式。
 - 新增 profile-first workload 语义层：`vllm_random` / `vllm_sharegpt` / `vllm_hf` / `vllm_custom` 与统一字段（`workload_profile`、`dataset_name`、`supplements`、`scenario_source`）。
 - 新增 `q1q8_supplement`，以 supplement 方式叠加到 mainline profile，不再作为独立平行入口。
 - `comparison.json` 与 canonical/parity 产物新增可追溯字段：`workload_profile`、`supplements`、`scenario_source`、`dataset_name`。
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README 与 QUICKSTART 现补充流式 serving benchmark、dataset 驱动压测、以及 `request_rate` / `burstiness` / `ramp_up` traffic API 的用法说明，并明确 `compare` 是唯一推荐的跨引擎入口，`vllm-compare` 仅保留 setup helper。
 
 ### Fixed
+- OpenAI-compatible chat stream benchmark 现在会显式识别 `event=error` SSE chunk，并把 `trace_id` / `error_code` 写入 `BenchmarkResult`；benchmark 不再把带结构化错误终止的流请求误计为成功完成。
 - chat-stream compare 在“首轮无 content delta token”场景下的重试日志由 warning 降为 info，并增加轻量异步退避，避免成功重试时在正式 compare 控制台产生误导性告警噪音。
 - `GatewayClient` 的 chat-stream benchmark 现对“无 content delta token 即结束”的随机流事件增加可配置重试（默认 1 次，可通过 `SAGELLM_BENCHMARK_STREAM_ZERO_CONTENT_RETRIES` 覆盖），以减少官方 `vllm_random` 场景下 `b2/b4` 的偶发 1/1 失败抖动，同时保持 strict minimal payload 与 `/v1/chat/completions` 主路径边界不变。
 - 删除 `workloads.py` 中已弃用的 `m1/year1/short/long/stress` selector 兼容分支；`test_workloads.py` 不再触发对应的 `DeprecationWarning`，示例与 leaderboard 导出也同步迁移到正式 workload 入口。
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync_results_to_website.sh` 与 website 离线聚合主链现在会同步 `leaderboard_compare.json`，不再只更新 single/multi snapshots 后让前端临时自行拼接所有 head-to-head gap。
 
 ### Changed
+- baseline regression 现在把 `peak_mem_mb` 与 `error_rate` 纳入统一阈值提取与回归判断；基线元数据会同时记录 `SAGELLM_BENCH_CR` / `SAGELLM_BENCH_CR_KILL` 合同开关状态，便于区分 chat mainline 合约基线与兼容层基线。
 - `run`/`compare`/`compare-record` 统一收敛到同一 profile 解析与场景构造流水线。
 - leaderboard 导出默认仅聚合 mainline 场景；可通过 `--leaderboard-include-supplements` 显式包含 supplements。
 

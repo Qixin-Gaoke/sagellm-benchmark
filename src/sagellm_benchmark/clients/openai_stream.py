@@ -74,6 +74,8 @@ class OpenAIStreamBenchmarker:
             started_at = self._time_fn()
             first_token_at: float | None = None
             last_token_at: float | None = None
+            trace_id: str | None = None
+            stream_error_code: str | None = None
             output_parts: list[str] = []
             itl_list: list[float] = []
             content_events = 0
@@ -108,6 +110,20 @@ class OpenAIStreamBenchmarker:
                             continue
 
                         payload = json.loads(event_data)
+                        trace_id = self._extract_trace_id(payload) or trace_id
+                        stream_error = self._extract_stream_error(payload)
+                        if stream_error is not None:
+                            stream_error_code = stream_error.get("code")
+                            return BenchmarkResult(
+                                request_id=request.request_id,
+                                success=False,
+                                error=stream_error.get("message")
+                                or "stream terminated with error event",
+                                error_code=stream_error_code,
+                                trace_id=trace_id,
+                                protocol_surface="chat_mainline",
+                                metrics=None,
+                            )
                         usage_prompt_tokens, usage_output_tokens = self._merge_usage_counts(
                             payload=payload,
                             prompt_tokens=usage_prompt_tokens,
@@ -137,6 +153,9 @@ class OpenAIStreamBenchmarker:
                     request_id=request.request_id,
                     success=False,
                     error=str(exc),
+                    error_code=stream_error_code,
+                    trace_id=trace_id,
+                    protocol_surface="chat_mainline",
                     metrics=None,
                 )
 
@@ -161,6 +180,8 @@ class OpenAIStreamBenchmarker:
                         "stream completed without content delta tokens; "
                         "refusing to emit zero-latency benchmark metrics"
                     ),
+                    trace_id=trace_id,
+                    protocol_surface="chat_mainline",
                     metrics=None,
                 )
 
@@ -225,6 +246,8 @@ class OpenAIStreamBenchmarker:
                 prompt_tokens=prompt_tokens,
                 itl_list=itl_list,
                 e2e_latency_ms=e2e_latency_ms,
+                trace_id=trace_id,
+                protocol_surface="chat_mainline",
             )
 
         raise RuntimeError("Unreachable state in OpenAIStreamBenchmarker.benchmark")
@@ -309,6 +332,27 @@ class OpenAIStreamBenchmarker:
                 parts.append(content)
 
         return "".join(parts)
+
+    @staticmethod
+    def _extract_trace_id(payload: dict[str, Any]) -> str | None:
+        trace_id = payload.get("trace_id")
+        return trace_id if isinstance(trace_id, str) and trace_id else None
+
+    @staticmethod
+    def _extract_stream_error(payload: dict[str, Any]) -> dict[str, str | None] | None:
+        if payload.get("event") != "error":
+            return None
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return {"message": "stream terminated with error event", "code": None}
+        message = error.get("message")
+        code = error.get("code")
+        return {
+            "message": message
+            if isinstance(message, str) and message
+            else "stream terminated with error event",
+            "code": code if isinstance(code, str) and code else None,
+        }
 
     @staticmethod
     def _merge_usage_counts(
