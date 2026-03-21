@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from sagellm_benchmark.baseline import BaselineManager
+from sagellm_benchmark.baseline import BaselineManager, BenchmarkBaselineConfig
 from sagellm_benchmark.regression import RegressionDetector, extract_metrics, render_markdown
 
 
@@ -24,6 +24,16 @@ def test_baseline_manager_update(tmp_path):
 
     assert saved["summary"]["avg_ttft_ms"] == 50.0
     assert "baseline_updated_at" in saved["metadata"]
+    assert saved["metadata"]["benchmark_contract"]["enabled"] is False
+
+
+def test_baseline_config_parses_contract_switches():
+    config = BenchmarkBaselineConfig.from_env(
+        {"SAGELLM_BENCH_CR": "1", "SAGELLM_BENCH_CR_KILL": "0"}
+    )
+
+    assert config.enabled is True
+    assert config.kill_switch_active is False
 
 
 def test_regression_detector_expected_change():
@@ -32,6 +42,8 @@ def test_regression_detector_expected_change():
             "avg_ttft_ms": 50.0,
             "avg_tbt_ms": 10.0,
             "avg_throughput_tps": 100.0,
+            "peak_mem_mb": 4000.0,
+            "error_rate": 0.01,
         }
     }
     current = {
@@ -39,6 +51,8 @@ def test_regression_detector_expected_change():
             "avg_ttft_ms": 58.0,
             "avg_tbt_ms": 10.6,
             "avg_throughput_tps": 96.0,
+            "peak_mem_mb": 4300.0,
+            "error_rate": 0.03,
         }
     }
 
@@ -51,7 +65,10 @@ def test_regression_detector_expected_change():
 
     assert summary["metrics"]["avg_ttft_ms"]["status"] == "expected-change"
     assert summary["metrics"]["avg_tbt_ms"]["status"] == "warning"
-    assert summary["overall_status"] == "warning"
+    assert summary["metrics"]["peak_mem_mb"]["status"] == "warning"
+    assert summary["metrics"]["error_rate"]["status"] == "critical"
+    assert summary["metrics"]["peak_mem_mb"]["direction"] == "lower-is-better"
+    assert summary["overall_status"] == "critical"
 
     report = render_markdown(summary)
     assert "allowlisted" in report
@@ -61,7 +78,7 @@ def test_extract_metrics_from_rows():
     payload = {
         "rows": [
             {"ttft_ms": 10, "tbt_ms": 5, "throughput_tps": 20},
-            {"ttft_ms": 30, "tbt_ms": 7, "throughput_tps": 10},
+            {"ttft_ms": 30, "tbt_ms": 7, "throughput_tps": 10, "memory_mb": 123, "ok": False},
         ]
     }
 
@@ -69,3 +86,5 @@ def test_extract_metrics_from_rows():
     assert metrics["avg_ttft_ms"] == 20.0
     assert metrics["avg_tbt_ms"] == 6.0
     assert metrics["avg_throughput_tps"] == 15.0
+    assert metrics["peak_mem_mb"] == 123.0
+    assert metrics["error_rate"] == 0.5

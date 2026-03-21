@@ -30,6 +30,8 @@ def extract_metrics(payload: dict[str, Any]) -> dict[str, float]:
             "avg_ttft_ms": float(summary.get("avg_ttft_ms", 0.0)),
             "avg_tbt_ms": float(summary.get("avg_tbt_ms", 0.0)),
             "avg_throughput_tps": float(summary.get("avg_throughput_tps", 0.0)),
+            "peak_mem_mb": float(summary.get("peak_mem_mb", 0.0)),
+            "error_rate": float(summary.get("error_rate", 0.0)),
         }
 
     rows = payload.get("rows", [])
@@ -39,10 +41,14 @@ def extract_metrics(payload: dict[str, Any]) -> dict[str, float]:
     avg_ttft = sum(float(row.get("ttft_ms", 0.0)) for row in rows) / len(rows)
     avg_tbt = sum(float(row.get("tbt_ms", 0.0)) for row in rows) / len(rows)
     avg_tps = sum(float(row.get("throughput_tps", 0.0)) for row in rows) / len(rows)
+    peak_mem = max(float(row.get("memory_mb", row.get("peak_mem_mb", 0.0)) or 0.0) for row in rows)
+    error_rate = sum(1 for row in rows if row.get("ok") is False) / len(rows)
     return {
         "avg_ttft_ms": avg_ttft,
         "avg_tbt_ms": avg_tbt,
         "avg_throughput_tps": avg_tps,
+        "peak_mem_mb": peak_mem,
+        "error_rate": error_rate,
     }
 
 
@@ -67,7 +73,7 @@ class RegressionDetector:
         """Compute metric checks from normalized summaries."""
         checks: list[MetricCheck] = []
 
-        for metric in ["avg_ttft_ms", "avg_tbt_ms"]:
+        for metric in ["avg_ttft_ms", "avg_tbt_ms", "peak_mem_mb", "error_rate"]:
             base_value = baseline_metrics[metric]
             current_value = current_metrics[metric]
             regression = (

@@ -8,6 +8,11 @@ from sagellm_benchmark._version import __version__
 from sagellm_benchmark.clients import (
     BenchmarkClient,
 )
+from sagellm_benchmark.compatibility_matrix import (
+    CompatibilityCase,
+    CompatibilityMatrixConfig,
+    evaluate_compatibility_matrix,
+)
 from sagellm_benchmark.core_telemetry import (
     CoreDecodeStepTelemetryRecord,
     CoreDecodeTelemetryArtifact,
@@ -50,6 +55,9 @@ from sagellm_benchmark.types import (
 
 __all__ = [
     "__version__",
+    "CompatibilityCase",
+    "CompatibilityMatrixConfig",
+    "evaluate_compatibility_matrix",
     # Types (契约定义)
     "BenchmarkRequest",
     "BenchmarkResult",
