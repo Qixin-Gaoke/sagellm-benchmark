@@ -15,6 +15,18 @@ class TableReporter:
     """
 
     @staticmethod
+    def _fmt_optional(value: float | int, unit: str = "") -> str:
+        if isinstance(value, float):
+            if value <= 0:
+                return "N/A"
+            return f"{value:.2f}{unit}"
+        if isinstance(value, int):
+            if value <= 0:
+                return "N/A"
+            return f"{value}{unit}"
+        return "N/A"
+
+    @staticmethod
     def generate(
         metrics: AggregatedMetrics,
         contract: ContractResult | None = None,
@@ -82,7 +94,9 @@ class TableReporter:
         latency_table.add_row("P95 TTFT", f"{metrics.p95_ttft_ms:.2f} ms")
         latency_table.add_row("P99 TTFT", f"{metrics.p99_ttft_ms:.2f} ms")
         latency_table.add_row("Avg TBT", f"{metrics.avg_tbt_ms:.2f} ms")
-        latency_table.add_row("Avg TPOT", f"{metrics.avg_tpot_ms:.2f} ms")
+        latency_table.add_row("Avg TPOT", TableReporter._fmt_optional(metrics.avg_tpot_ms, " ms"))
+        latency_table.add_row("Avg ITL", TableReporter._fmt_optional(metrics.avg_itl_ms, " ms"))
+        latency_table.add_row("Avg E2EL", TableReporter._fmt_optional(metrics.avg_e2el_ms, " ms"))
 
         console.print(latency_table)
         console.print()
@@ -94,15 +108,26 @@ class TableReporter:
 
         # 对标 vLLM/SGLang 的新增吞吐量指标
         throughput_table.add_row(
-            "Request Throughput", f"{metrics.request_throughput_rps:.2f} req/s"
+            "Request Throughput",
+            TableReporter._fmt_optional(metrics.request_throughput_rps, " req/s"),
         )
-        throughput_table.add_row("Input Throughput", f"{metrics.input_throughput_tps:.2f} tokens/s")
         throughput_table.add_row(
-            "Output Throughput", f"{metrics.output_throughput_tps:.2f} tokens/s"
+            "Input Throughput",
+            TableReporter._fmt_optional(metrics.input_throughput_tps, " tokens/s"),
+        )
+        throughput_table.add_row(
+            "Output Throughput",
+            TableReporter._fmt_optional(metrics.output_throughput_tps, " tokens/s"),
         )
         throughput_table.add_row("Total Throughput", f"{metrics.total_throughput_tps:.2f} tokens/s")
         # 保持现有指标
         throughput_table.add_row("Avg Throughput", f"{metrics.avg_throughput_tps:.2f} tokens/s")
+        throughput_table.add_row(
+            "Total Input Tokens", TableReporter._fmt_optional(metrics.total_input_tokens)
+        )
+        throughput_table.add_row(
+            "Total Output Tokens", TableReporter._fmt_optional(metrics.total_output_tokens)
+        )
 
         console.print(throughput_table)
         console.print()
@@ -166,14 +191,24 @@ class TableReporter:
         print(f"P95 TTFT: {metrics.p95_ttft_ms:.2f} ms")
         print(f"P99 TTFT: {metrics.p99_ttft_ms:.2f} ms")
         print(f"Avg TBT: {metrics.avg_tbt_ms:.2f} ms")
-        print(f"Avg TPOT: {metrics.avg_tpot_ms:.2f} ms")
+        print(f"Avg TPOT: {TableReporter._fmt_optional(metrics.avg_tpot_ms, ' ms')}")
+        print(f"Avg ITL: {TableReporter._fmt_optional(metrics.avg_itl_ms, ' ms')}")
+        print(f"Avg E2EL: {TableReporter._fmt_optional(metrics.avg_e2el_ms, ' ms')}")
 
         print("\n=== Throughput ===")
-        print(f"Request Throughput: {metrics.request_throughput_rps:.2f} req/s")
-        print(f"Input Throughput: {metrics.input_throughput_tps:.2f} tokens/s")
-        print(f"Output Throughput: {metrics.output_throughput_tps:.2f} tokens/s")
+        print(
+            f"Request Throughput: {TableReporter._fmt_optional(metrics.request_throughput_rps, ' req/s')}"
+        )
+        print(
+            f"Input Throughput: {TableReporter._fmt_optional(metrics.input_throughput_tps, ' tokens/s')}"
+        )
+        print(
+            f"Output Throughput: {TableReporter._fmt_optional(metrics.output_throughput_tps, ' tokens/s')}"
+        )
         print(f"Total Throughput: {metrics.total_throughput_tps:.2f} tokens/s")
         print(f"Avg Throughput: {metrics.avg_throughput_tps:.2f} tokens/s")
+        print(f"Total Input Tokens: {TableReporter._fmt_optional(metrics.total_input_tokens)}")
+        print(f"Total Output Tokens: {TableReporter._fmt_optional(metrics.total_output_tokens)}")
 
         print("\n=== Memory & KV Cache ===")
         print(f"Peak Memory: {metrics.peak_mem_mb} MB")

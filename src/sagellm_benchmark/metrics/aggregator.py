@@ -44,9 +44,13 @@ class MetricsAggregator:
         if not results:
             return aggregated
 
+        included_results = [r for r in results if not getattr(r, "is_warmup", False)]
+        if not included_results:
+            return aggregated
+
         # 统计总数
-        aggregated.total_requests = len(results)
-        successful = [r for r in results if r.success and r.metrics is not None]
+        aggregated.total_requests = len(included_results)
+        successful = [r for r in included_results if r.success and r.metrics is not None]
         aggregated.successful_requests = len(successful)
         aggregated.failed_requests = aggregated.total_requests - aggregated.successful_requests
         aggregated.error_rate = (
@@ -59,7 +63,7 @@ class MetricsAggregator:
         if not successful:
             return aggregated
 
-        # 收集时间戳（从 timestamps 对象中获取）
+        # 收集时间戳（从 timestamps 对象中获取），batch 模式优先使用统一墙钟时长。
         start_times = [
             r.metrics.timestamps.queued_at
             for r in successful
@@ -71,7 +75,18 @@ class MetricsAggregator:
             if r.metrics.timestamps is not None and r.metrics.timestamps.completed_at > 0
         ]
 
-        if start_times and end_times:
+        batch_total_times = [
+            MetricsAggregator._batch_total_time_s(r)
+            for r in successful
+            if MetricsAggregator._batch_total_time_s(r) > 0
+        ]
+
+        if batch_total_times:
+            aggregated.total_time_s = max(batch_total_times)
+            if start_times:
+                aggregated.start_time = min(start_times)
+                aggregated.end_time = aggregated.start_time + aggregated.total_time_s
+        elif start_times and end_times:
             aggregated.start_time = min(start_times)
             aggregated.end_time = max(end_times)
             aggregated.total_time_s = aggregated.end_time - aggregated.start_time
@@ -103,8 +118,8 @@ class MetricsAggregator:
         # === ITL 指标（展平所有请求的 itl_list）===
         all_itl: list[float] = []
         for r in successful:
-            if r.itl_list:
-                all_itl.extend(r.itl_list)
+            itl_samples = r.itl_list or list(getattr(r.metrics, "itl_list", []) or [])
+            all_itl.extend(sample for sample in itl_samples if sample > 0)
 
         if all_itl:
             aggregated.avg_itl_ms = statistics.mean(all_itl)
@@ -115,7 +130,8 @@ class MetricsAggregator:
                 aggregated.std_itl_ms = statistics.stdev(all_itl)
 
         # === E2E Latency 指标 ===
-        e2el_samples = [r.e2e_latency_ms for r in successful if r.e2e_latency_ms > 0]
+        e2el_samples = [MetricsAggregator._resolve_e2e_latency_ms(r) for r in successful]
+        e2el_samples = [sample for sample in e2el_samples if sample > 0]
 
         if e2el_samples:
             aggregated.avg_e2el_ms = statistics.mean(e2el_samples)
@@ -180,6 +196,32 @@ class MetricsAggregator:
             aggregated.avg_spec_accept_rate = statistics.mean(spec_samples)
 
         return aggregated
+
+    @staticmethod
+    def _batch_total_time_s(result: BenchmarkResult) -> float:
+        batch_total_time_s = getattr(result, "batch_total_time_s", 0.0)
+        if batch_total_time_s > 0:
+            return float(batch_total_time_s)
+
+        legacy_batch_total_time_s = getattr(result, "_batch_total_time_s", 0.0)
+        if legacy_batch_total_time_s > 0:
+            return float(legacy_batch_total_time_s)
+
+        return 0.0
+
+    @staticmethod
+    def _resolve_e2e_latency_ms(result: BenchmarkResult) -> float:
+        if result.e2e_latency_ms > 0:
+            return result.e2e_latency_ms
+
+        timestamps = result.metrics.timestamps if result.metrics is not None else None
+        if timestamps is None:
+            return 0.0
+
+        if timestamps.queued_at > 0 and timestamps.completed_at > 0:
+            return (timestamps.completed_at - timestamps.queued_at) * 1000.0
+
+        return 0.0
 
     @staticmethod
     def _percentile(samples: list[float], p: float) -> float:

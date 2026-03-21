@@ -24,7 +24,7 @@ def benchmark_results_dir():
             "rows": [
                 {
                     "model": "Qwen2-7B",
-                    "scenario": "short_b1",
+                    "scenario": "vllm_random_b1",
                     "backend": "sagellm-cpu",
                     "hardware": "Intel Xeon",
                     "ttft_ms": 25.0,
@@ -36,7 +36,7 @@ def benchmark_results_dir():
                 },
                 {
                     "model": "Qwen2-7B",
-                    "scenario": "long_b1",
+                    "scenario": "vllm_sharegpt_b1",
                     "backend": "sagellm-cpu",
                     "hardware": "Intel Xeon",
                     "ttft_ms": 80.0,
@@ -53,7 +53,7 @@ def benchmark_results_dir():
         # Write a second file (aggregated metrics format)
         data2 = {
             "model": "tiny-gpt2",
-            "workload": "short_b1",
+            "workload": "vllm_random_b1",
             "backend": "vllm",
             "metrics": {
                 "avg_ttft_ms": 12.0,
@@ -93,8 +93,8 @@ def test_dashboard_generate_returns_html(benchmark_results_dir: Path) -> None:
 def test_dashboard_generate_contains_scenarios(benchmark_results_dir: Path) -> None:
     db = RankingDashboard(results_dir=benchmark_results_dir)
     html = db.generate()
-    assert "short_b1" in html
-    assert "long_b1" in html
+    assert "vllm_random_b1" in html
+    assert "vllm_sharegpt_b1" in html
 
 
 def test_dashboard_saves_file(benchmark_results_dir: Path) -> None:

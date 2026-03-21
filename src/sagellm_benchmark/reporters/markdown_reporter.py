@@ -17,6 +17,24 @@ class MarkdownReporter:
     """
 
     @staticmethod
+    def _fmt_required(value: float | int, unit: str = "") -> str:
+        if isinstance(value, float):
+            return f"{value:.2f}{unit}"
+        return f"{value}{unit}"
+
+    @staticmethod
+    def _fmt_optional(value: float | int, unit: str = "") -> str:
+        if isinstance(value, float):
+            if value <= 0:
+                return "N/A"
+            return f"{value:.2f}{unit}"
+        if isinstance(value, int):
+            if value <= 0:
+                return "N/A"
+            return f"{value}{unit}"
+        return "N/A"
+
+    @staticmethod
     def generate(
         metrics: AggregatedMetrics,
         contract: ContractResult | None = None,
@@ -78,12 +96,23 @@ class MarkdownReporter:
         lines.append("")
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
-        lines.append(f"| Avg TTFT | {metrics.avg_ttft_ms:.2f} ms |")
-        lines.append(f"| P50 TTFT | {metrics.p50_ttft_ms:.2f} ms |")
-        lines.append(f"| P95 TTFT | {metrics.p95_ttft_ms:.2f} ms |")
-        lines.append(f"| P99 TTFT | {metrics.p99_ttft_ms:.2f} ms |")
-        lines.append(f"| Avg TBT | {metrics.avg_tbt_ms:.2f} ms |")
-        lines.append(f"| Avg TPOT | {metrics.avg_tpot_ms:.2f} ms |")
+        lines.append(f"| Avg TTFT | {MarkdownReporter._fmt_required(metrics.avg_ttft_ms, ' ms')} |")
+        lines.append(f"| P50 TTFT | {MarkdownReporter._fmt_required(metrics.p50_ttft_ms, ' ms')} |")
+        lines.append(f"| P95 TTFT | {MarkdownReporter._fmt_required(metrics.p95_ttft_ms, ' ms')} |")
+        lines.append(f"| P99 TTFT | {MarkdownReporter._fmt_required(metrics.p99_ttft_ms, ' ms')} |")
+        lines.append(f"| Avg TBT | {MarkdownReporter._fmt_required(metrics.avg_tbt_ms, ' ms')} |")
+        lines.append(f"| Avg TPOT | {MarkdownReporter._fmt_optional(metrics.avg_tpot_ms, ' ms')} |")
+        lines.append(f"| P50 TPOT | {MarkdownReporter._fmt_optional(metrics.p50_tpot_ms, ' ms')} |")
+        lines.append(f"| P95 TPOT | {MarkdownReporter._fmt_optional(metrics.p95_tpot_ms, ' ms')} |")
+        lines.append(f"| P99 TPOT | {MarkdownReporter._fmt_optional(metrics.p99_tpot_ms, ' ms')} |")
+        lines.append(f"| Avg ITL | {MarkdownReporter._fmt_optional(metrics.avg_itl_ms, ' ms')} |")
+        lines.append(f"| P50 ITL | {MarkdownReporter._fmt_optional(metrics.p50_itl_ms, ' ms')} |")
+        lines.append(f"| P95 ITL | {MarkdownReporter._fmt_optional(metrics.p95_itl_ms, ' ms')} |")
+        lines.append(f"| P99 ITL | {MarkdownReporter._fmt_optional(metrics.p99_itl_ms, ' ms')} |")
+        lines.append(f"| Avg E2EL | {MarkdownReporter._fmt_optional(metrics.avg_e2el_ms, ' ms')} |")
+        lines.append(f"| P50 E2EL | {MarkdownReporter._fmt_optional(metrics.p50_e2el_ms, ' ms')} |")
+        lines.append(f"| P95 E2EL | {MarkdownReporter._fmt_optional(metrics.p95_e2el_ms, ' ms')} |")
+        lines.append(f"| P99 E2EL | {MarkdownReporter._fmt_optional(metrics.p99_e2el_ms, ' ms')} |")
         lines.append("")
 
         # === 吞吐 ===
@@ -91,11 +120,27 @@ class MarkdownReporter:
         lines.append("")
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
-        lines.append(f"| Request Throughput | {metrics.request_throughput_rps:.2f} req/s |")
-        lines.append(f"| Input Throughput | {metrics.input_throughput_tps:.2f} tokens/s |")
-        lines.append(f"| Output Throughput | {metrics.output_throughput_tps:.2f} tokens/s |")
-        lines.append(f"| Total Throughput | {metrics.total_throughput_tps:.2f} tokens/s |")
-        lines.append(f"| Avg Throughput | {metrics.avg_throughput_tps:.2f} tokens/s |")
+        lines.append(
+            f"| Request Throughput | {MarkdownReporter._fmt_optional(metrics.request_throughput_rps, ' req/s')} |"
+        )
+        lines.append(
+            f"| Input Throughput | {MarkdownReporter._fmt_optional(metrics.input_throughput_tps, ' tokens/s')} |"
+        )
+        lines.append(
+            f"| Output Throughput | {MarkdownReporter._fmt_optional(metrics.output_throughput_tps, ' tokens/s')} |"
+        )
+        lines.append(
+            f"| Total Throughput | {MarkdownReporter._fmt_required(metrics.total_throughput_tps, ' tokens/s')} |"
+        )
+        lines.append(
+            f"| Avg Throughput | {MarkdownReporter._fmt_required(metrics.avg_throughput_tps, ' tokens/s')} |"
+        )
+        lines.append(
+            f"| Total Input Tokens | {MarkdownReporter._fmt_optional(metrics.total_input_tokens)} |"
+        )
+        lines.append(
+            f"| Total Output Tokens | {MarkdownReporter._fmt_optional(metrics.total_output_tokens)} |"
+        )
         lines.append("")
 
         # === 内存 ===

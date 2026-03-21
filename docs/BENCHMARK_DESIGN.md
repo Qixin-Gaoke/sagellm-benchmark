@@ -1,4 +1,145 @@
-# sagellm-benchmark 设计文档
+# sagellm-benchmark Design
+
+> Last updated: 2026-03-14
+> Status: active
+
+## 1. Positioning
+
+`sagellm-benchmark` owns benchmark orchestration, artifact generation, publish/export boundaries, and third-party engine comparison flows. It does not own engine execution logic, protocol definitions, or serving runtime internals.
+
+Benchmark outputs are now **canonical-first**:
+
+- Benchmark execution writes `*.canonical.json` first.
+- Legacy leaderboard files are derived later as a compatibility export boundary.
+- Publish/HF/website sync consume that explicit compatibility boundary instead of acting as an internal source of truth.
+
+## 2. Entrypoint Responsibilities
+
+| Entrypoint | Role | Status | Notes |
+|---|---|---|---|
+| `sagellm-benchmark run` | Canonical local workload benchmark pipeline | Mainline | Produces local workload `execution_result` canonical artifacts. |
+| `sagellm-benchmark compare` | Canonical live multi-endpoint benchmark pipeline | Mainline | Produces one canonical `execution_result` per target plus one canonical comparison summary. |
+| `sagellm-benchmark vllm-compare run` | Semantic convenience wrapper for standard `sageLLM vs vLLM` compare | Convenience layer | Reuses `compare`; it is not a separate benchmark pipeline. |
+| `./run_benchmark.sh --profile quick` | Shell convenience wrapper for local default run | Compatibility layer | Reuses `sagellm-benchmark run`; retained for scripting/backward compatibility. |
+| `./run_benchmark.sh --profile convergence` | Shell convenience wrapper for compare plus extra probes | Compatibility layer | Reuses `sagellm-benchmark compare` and adds `/info`/`/metrics`/log probes plus validation packaging. |
+| `sagellm-benchmark compare-record` | Single-target capture helper for constrained environments | Compatibility layer | Reuses the canonical compare target pipeline; useful when endpoints cannot coexist. |
+| `sagellm-benchmark compare-offline` | Offline summary helper over captured results | Compatibility layer | Does not define a new benchmark pipeline. |
+
+## 3. Recommended Paths
+
+Only two benchmark execution paths are recommended:
+
+1. `sagellm-benchmark run` for local workload benchmarks.
+2. `sagellm-benchmark compare` for live endpoint comparison.
+
+Use `sagellm-benchmark vllm-compare run` only when the goal is the standard `sageLLM vs vLLM` workflow and the semantic wrapper improves operability. Use `run_benchmark.sh` only when an existing shell workflow depends on it.
+
+## 4. Canonical-First Pipeline
+
+### 4.1 Local run
+
+`run` writes:
+
+- `config.json`
+- `benchmark_summary.json`
+- `*_metrics.json`
+- `*.canonical.json` as the benchmark source of truth
+- compatibility exports: `*_leaderboard.json`, `leaderboard_manifest.json`
+
+### 4.2 Live compare
+
+`compare` writes:
+
+- `<label>.json` and `<label>.md` for raw capture/reporting
+- `<label>.canonical.json` as the canonical per-target result
+- `<label>.parity.json` and runtime evidence artifacts
+- `comparison.json`, `comparison.md`, `comparison.canonical.json`
+- compatibility exports: `*_leaderboard.json`, `leaderboard_manifest.json`
+
+### 4.3 Publish boundary
+
+Publish is explicit:
+
+- `run --publish`
+- `compare --publish`
+- `vllm-compare run --publish`
+
+Publish first regenerates the compatibility export boundary from canonical artifacts, then uploads canonical per-entry files plus website-facing HF snapshots.
+
+## 5. Compatibility Boundary
+
+The following files are **compatibility artifacts**, not the internal benchmark source of truth:
+
+- `*_leaderboard.json`
+- `leaderboard_manifest.json`
+- `leaderboard_single.json`
+- `leaderboard_multi.json`
+- `last_updated.json`
+
+Rules:
+
+- Benchmark execution logic must not depend on these files.
+- Export/upload/sync flows may consume them only at the compatibility boundary.
+- If a compatibility artifact is missing or invalid, export must fail fast rather than silently guessing fields.
+
+## 6. Chat-First and No Fork Rules
+
+Benchmark protocol behavior stays aligned with SageLLM serving boundaries:
+
+- benchmark compare paths target OpenAI-compatible chat flows first
+- do not introduce a completions-only benchmark fork
+- `/v1/completions` remains compatibility-only and must not become a separate benchmark mainline
+- no silent fallback from canonical compare to a second legacy leaderboard-first path
+- no silent fallback from requested datasets or runtime evidence requirements
+
+## 7. Why Old Leaderboard-First Wiring Was Removed
+
+The old shape allowed `run` and `compare` to both write leaderboard files directly during execution. That caused two structural problems:
+
+1. benchmark semantics were split across canonical artifacts and leaderboard export rows
+2. shell wrappers and publish flows could accidentally treat compatibility files as the primary result model
+
+The current design removes that branch:
+
+- execution paths write canonical artifacts only
+- compatibility exports are generated afterward by one shared exporter
+- warnings make it explicit when a user invokes a compatibility or convenience layer
+
+## 8. Operational Guidance
+
+### Recommended commands
+
+```bash
+# Local canonical workload benchmark
+sagellm-benchmark run --workload all --backend cpu
+
+# Canonical live endpoint compare
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --hardware-family cuda
+
+# Standard semantic wrapper for sageLLM vs vLLM
+sagellm-benchmark vllm-compare run \
+  --sagellm-url http://127.0.0.1:8901/v1 \
+  --vllm-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --hardware-family ascend
+```
+
+### Compatibility wrappers
+
+```bash
+# Backward-compatible shell wrapper over `run`
+./run_benchmark.sh --profile quick
+
+# Backward-compatible shell wrapper over `compare` plus probes
+./run_benchmark.sh --profile convergence \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct
+```# sagellm-benchmark 设计文档
 
 > **最后更新**：2026-01-17  
 > **版本**：v0.1.0.2  
@@ -207,3 +348,21 @@ isagellm-benchmark (本仓库)
 - `Metrics` 必须严格对齐 `sagellm_protocol.Metrics` 字段
 - CPU 模式必须可在 CI 运行（无 GPU）
 - 不引入 engine 依赖到 datasets/reporters 模块
+
+## 11. Canonical Artifact Direction
+
+- 统一 benchmark artifact schema 设计见 [CANONICAL_RESULT_SCHEMA.md](CANONICAL_RESULT_SCHEMA.md)
+- 后续 `run` / `compare` / `convergence` 应先落 canonical artifact，再导出 leaderboard JSON
+- leaderboard 不应继续作为 benchmark 内部唯一事实源
+
+## 12. Publish Boundary
+
+- Local benchmark outputs are responsible for producing:
+    - `*.canonical.json`
+    - per-entry `*_leaderboard.json`
+    - `leaderboard_manifest.json`
+- `upload-hf` must consume only the standard export boundary above and publish:
+    - canonical per-entry files under dataset `canonical/...`
+    - website-facing HF snapshots `leaderboard_single.json`, `leaderboard_multi.json`, `last_updated.json`
+- `sagellm-website` should treat the HF snapshots as the primary runtime data source.
+- Local website sync is only an offline compatibility path and must consume `leaderboard_manifest.json`, not compare raw directories or ad hoc file globs.

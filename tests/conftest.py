@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
+# Keep pytest CPU-safe on Ascend hosts before any helper imports torch.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import pytest
 
 

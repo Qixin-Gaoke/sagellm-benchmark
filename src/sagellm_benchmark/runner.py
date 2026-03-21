@@ -80,9 +80,6 @@ class BenchmarkRunner:
             reporter.generate(aggregated_metrics, output_path=str(output_file))
             logger.info(f"Saved metrics to {output_file}")
 
-            # Export to leaderboard format
-            self._export_leaderboard_entry(workload.name, aggregated_metrics)
-
         # Save summary
         self._save_summary()
 
@@ -248,39 +245,6 @@ class BenchmarkRunner:
         summary_file = self.config.output_dir / "benchmark_summary.json"
         summary_file.write_text(json.dumps(summary, indent=2))
         logger.info(f"Saved summary to {summary_file}")
-
-    def _export_leaderboard_entry(self, workload_name: str, metrics: AggregatedMetrics) -> None:
-        """Export results to leaderboard format.
-
-        Args:
-            workload_name: Name of the workload
-            metrics: Aggregated metrics
-        """
-        from sagellm_benchmark.exporters import LeaderboardExporter
-
-        # Load config.json
-        config_file = self.config.output_dir / "config.json"
-        if not config_file.exists():
-            logger.warning("config.json not found, skipping leaderboard export")
-            return
-
-        import json
-
-        with open(config_file) as f:
-            config = json.load(f)
-
-        # Export to leaderboard format
-        output_file = self.config.output_dir / f"{workload_name}_leaderboard.json"
-        try:
-            LeaderboardExporter.export_to_leaderboard(
-                metrics=metrics,
-                config=config,
-                workload_name=workload_name,
-                output_path=output_file,
-            )
-            logger.info(f"Exported leaderboard entry to {output_file}")
-        except Exception as e:
-            logger.error(f"Failed to export leaderboard entry: {e}")
 
 
 async def run_year1_benchmark(

@@ -20,11 +20,17 @@ def sample_metrics() -> AggregatedMetrics:
         p99_ttft_ms=55.0,
         avg_tbt_ms=5.0,
         avg_tpot_ms=4.5,
+        avg_itl_ms=3.0,
+        p95_itl_ms=4.5,
+        avg_e2el_ms=48.0,
+        p95_e2el_ms=60.0,
         avg_throughput_tps=75.0,
         total_throughput_tps=90.0,
         input_throughput_tps=30.0,
         output_throughput_tps=75.0,
         request_throughput_rps=3.5,
+        total_input_tokens=150,
+        total_output_tokens=375,
         total_requests=10,
         successful_requests=10,
         failed_requests=0,
@@ -74,6 +80,9 @@ def test_html_reporter_contains_metrics(sample_metrics: AggregatedMetrics) -> No
     # Key metric values should appear in the output
     assert "25.0" in html or "25" in html  # avg_ttft_ms
     assert "10" in html  # total_requests
+    assert "Avg E2EL" in html
+    assert "Avg ITL" in html
+    assert "Total Output Tokens" in html
 
 
 def test_html_reporter_with_contract(
@@ -148,3 +157,24 @@ def test_html_reporter_exported_from_reporters_module() -> None:
     from sagellm_benchmark.reporters import HTMLReporter as HTMLReporterAliased  # noqa: F401
 
     assert HTMLReporterAliased is HTMLReporter
+
+
+def test_html_reporter_honest_degrades_missing_stream_metrics() -> None:
+    metrics = AggregatedMetrics(
+        avg_ttft_ms=25.0,
+        p50_ttft_ms=22.0,
+        p95_ttft_ms=40.0,
+        p99_ttft_ms=55.0,
+        avg_tbt_ms=5.0,
+        avg_throughput_tps=75.0,
+        total_throughput_tps=90.0,
+        total_requests=10,
+        successful_requests=10,
+        peak_mem_mb=1024,
+    )
+
+    html = HTMLReporter.generate(metrics)
+
+    assert "N/A" in html
+    assert "Avg E2EL" in html
+    assert "Output Throughput" in html

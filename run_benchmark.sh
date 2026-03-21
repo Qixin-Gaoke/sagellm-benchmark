@@ -13,7 +13,11 @@ SERVER_WAIT_S="120"
 MAX_OUTPUT_TOKENS="64"
 WORKLOAD="all"
 BACKEND="cpu"
-UPLOAD_HF_MODE="auto"
+PUBLISH=0
+PUBLISH_DRY_RUN=0
+PUBLISH_WEBSITE_DIR=""
+PUBLISH_HF_DATASET="intellistream/sagellm-benchmark-results"
+PUBLISH_HF_PRIVATE=0
 PROMPT_CLEANUP=0
 BATCH_SIZES_SET=0
 declare -a BATCH_SIZES=("1" "2" "4")
@@ -33,8 +37,8 @@ Usage:
   ./run_benchmark.sh --profile convergence --target LABEL=URL --target LABEL=URL [options]
 
 Profiles:
-  quick        Run the default CPU Q1-Q8 suite and optional HF upload.
-  convergence  Compare live OpenAI-compatible endpoints and capture validation artifacts.
+    quick        Compatibility wrapper over `sagellm-benchmark run` for the default CPU Q1-Q8 suite.
+    convergence  Compatibility wrapper over `sagellm-benchmark compare` plus probe/validation packaging.
 
 Convergence options:
   --target LABEL=URL            Repeat at least twice.
@@ -51,7 +55,11 @@ Convergence options:
 Quick options:
   --workload NAME               Default: all.
   --backend NAME                Default: cpu.
-  --upload-hf auto|always|never Default: auto.
+    --publish                     Run the unified CLI publish workflow after benchmark success.
+    --publish-dry-run             Validate publish/export/upload/sync plan without external writes.
+    --publish-website-dir DIR     Optional sagellm-website repo root for local snapshot sync.
+    --publish-hf-dataset DATASET  Default: intellistream/sagellm-benchmark-results.
+    --publish-hf-private          Create HF dataset as private if publish creates it.
 
 General options:
   --output-dir DIR
@@ -405,67 +413,62 @@ PY
 
 run_quick_profile() {
     local output_dir="$1"
+    local -a run_cmd=(
+        sagellm-benchmark run
+        --workload "$WORKLOAD"
+        --backend "$BACKEND"
+        --output "$output_dir"
+        -v
+    )
+
+    if [[ "$PUBLISH" -eq 1 ]]; then
+        run_cmd+=(--publish --publish-hf-dataset "$PUBLISH_HF_DATASET")
+        if [[ "$PUBLISH_DRY_RUN" -eq 1 ]]; then
+            run_cmd+=(--publish-dry-run)
+        fi
+        if [[ "$PUBLISH_HF_PRIVATE" -eq 1 ]]; then
+            run_cmd+=(--publish-hf-private)
+        else
+            run_cmd+=(--publish-hf-public)
+        fi
+        if [[ -n "$PUBLISH_WEBSITE_DIR" ]]; then
+            run_cmd+=(--publish-website-dir "$PUBLISH_WEBSITE_DIR")
+        fi
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            run_cmd+=(--publish-hf-token "$HF_TOKEN")
+        fi
+    fi
 
     echo "======================================"
     echo "  sageLLM Benchmark - Q1~Q8 Workloads"
     echo "======================================"
+    echo "Warning: quick is a compatibility wrapper over 'sagellm-benchmark run'." >&2
+    echo "Canonical *.canonical.json artifacts are the source of truth; leaderboard JSON is compatibility output only." >&2
     echo
     echo "Output directory: $output_dir"
     echo
 
     require_command sagellm-benchmark
 
-    echo "[1/5] Running ${WORKLOAD} workloads with ${BACKEND} backend..."
-    sagellm-benchmark run --workload "$WORKLOAD" --backend "$BACKEND" --output "$output_dir" -v
+    echo "[1/4] Running ${WORKLOAD} workloads with ${BACKEND} backend..."
+    "${run_cmd[@]}"
 
     echo
-    echo "[2/5] Generating summary report..."
+    echo "[2/4] Generating summary report..."
     sagellm-benchmark report --input "$output_dir/benchmark_summary.json" --format table
 
     echo
-    echo "[3/5] Generating markdown report..."
+    echo "[3/4] Generating markdown report..."
     sagellm-benchmark report --input "$output_dir/benchmark_summary.json" --format markdown >"$output_dir/REPORT.md"
 
     echo
-    echo "[4/5] Results saved to:"
+    echo "[4/4] Results saved to:"
     echo "  - $output_dir/benchmark_summary.json"
+    echo "  - $output_dir/Q1.canonical.json ... Q8.canonical.json"
     echo "  - $output_dir/Q1_metrics.json ... Q8_metrics.json"
-    echo "  - $output_dir/Q1_leaderboard.json ... Q8_leaderboard.json"
+    echo "  - $output_dir/Q1_leaderboard.json ... Q8_leaderboard.json (compatibility export)"
+    echo "  - $output_dir/leaderboard_manifest.json (compatibility export boundary)"
     echo "  - $output_dir/REPORT.md"
-
-    echo
-    case "$UPLOAD_HF_MODE" in
-        always)
-            echo "[5/5] Uploading leaderboard data to Hugging Face..."
-            sagellm-benchmark upload-hf \
-                --input "$output_dir" \
-                --dataset intellistream/sagellm-benchmark-results \
-                --token "${HF_TOKEN:?HF_TOKEN must be set when --upload-hf always is used}"
-            echo
-            echo "✓ HF upload complete!"
-            ;;
-        auto)
-            if [[ -n "${HF_TOKEN:-}" ]]; then
-                echo "[5/5] Uploading leaderboard data to Hugging Face..."
-                sagellm-benchmark upload-hf \
-                    --input "$output_dir" \
-                    --dataset intellistream/sagellm-benchmark-results \
-                    --token "$HF_TOKEN"
-                echo
-                echo "✓ HF upload complete!"
-            else
-                echo "[5/5] Skipping HF upload (HF_TOKEN not set)"
-                echo "      To enable: export HF_TOKEN=hf_xxx && ./run_benchmark.sh"
-            fi
-            ;;
-        never)
-            echo "[5/5] Skipping HF upload (--upload-hf never)"
-            ;;
-        *)
-            echo "Error: unsupported --upload-hf mode: $UPLOAD_HF_MODE" >&2
-            exit 1
-            ;;
-    esac
 
     echo
     echo "✓ Benchmark completed successfully!"
@@ -508,10 +511,29 @@ run_convergence_profile() {
         --output-dir "$output_dir"
         "$prompt_flag"
     )
+    if [[ "$PUBLISH" -eq 1 ]]; then
+        compare_cmd+=(--publish --publish-hf-dataset "$PUBLISH_HF_DATASET")
+        if [[ "$PUBLISH_DRY_RUN" -eq 1 ]]; then
+            compare_cmd+=(--publish-dry-run)
+        fi
+        if [[ "$PUBLISH_HF_PRIVATE" -eq 1 ]]; then
+            compare_cmd+=(--publish-hf-private)
+        else
+            compare_cmd+=(--publish-hf-public)
+        fi
+        if [[ -n "$PUBLISH_WEBSITE_DIR" ]]; then
+            compare_cmd+=(--publish-website-dir "$PUBLISH_WEBSITE_DIR")
+        fi
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            compare_cmd+=(--publish-hf-token "$HF_TOKEN")
+        fi
+    fi
 
     echo "==============================================="
     echo "  sageLLM Benchmark - Convergence Validation"
     echo "==============================================="
+    echo "Warning: convergence is a compatibility wrapper over 'sagellm-benchmark compare'." >&2
+    echo "It reuses compare's canonical artifacts and only adds probe capture plus validation packaging." >&2
     echo
     echo "Output directory: $output_dir"
     echo "Model: $MODEL"
@@ -547,7 +569,9 @@ run_convergence_profile() {
 
     echo
     echo "Artifacts saved to:"
+    echo "  - $output_dir/*.canonical.json"
     echo "  - $output_dir/comparison.json"
+    echo "  - $output_dir/leaderboard_manifest.json (compatibility export boundary)"
     echo "  - $output_dir/comparison.md"
     echo "  - $output_dir/validation_summary.json"
     echo "  - $output_dir/VALIDATION.md"
@@ -613,8 +637,36 @@ while [[ $# -gt 0 ]]; do
             BACKEND="$2"
             shift 2
             ;;
+        --publish)
+            PUBLISH=1
+            shift
+            ;;
+        --publish-dry-run)
+            PUBLISH=1
+            PUBLISH_DRY_RUN=1
+            shift
+            ;;
+        --publish-website-dir)
+            PUBLISH_WEBSITE_DIR="$2"
+            shift 2
+            ;;
+        --publish-hf-dataset)
+            PUBLISH_HF_DATASET="$2"
+            shift 2
+            ;;
+        --publish-hf-private)
+            PUBLISH_HF_PRIVATE=1
+            shift
+            ;;
         --upload-hf)
-            UPLOAD_HF_MODE="$2"
+            if [[ "$2" == "always" ]]; then
+                PUBLISH=1
+            elif [[ "$2" == "never" ]]; then
+                PUBLISH=0
+            else
+                echo "Error: --upload-hf auto is no longer supported; use --publish explicitly" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --prompt-cleanup)

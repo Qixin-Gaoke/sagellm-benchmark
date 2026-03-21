@@ -21,8 +21,24 @@ def sample_aggregated_metrics() -> AggregatedMetrics:
         p99_ttft_ms=30.0,
         avg_tbt_ms=4.0,
         avg_tpot_ms=3.5,
+        p50_tpot_ms=3.2,
+        p95_tpot_ms=4.1,
+        p99_tpot_ms=4.6,
+        avg_itl_ms=2.8,
+        p50_itl_ms=2.5,
+        p95_itl_ms=3.6,
+        p99_itl_ms=4.0,
+        avg_e2el_ms=42.0,
+        p50_e2el_ms=40.0,
+        p95_e2el_ms=55.0,
+        p99_e2el_ms=60.0,
         avg_throughput_tps=80.0,
         total_throughput_tps=100.0,
+        request_throughput_rps=5.0,
+        input_throughput_tps=20.0,
+        output_throughput_tps=80.0,
+        total_input_tokens=200,
+        total_output_tokens=800,
         total_requests=5,
         successful_requests=5,
         failed_requests=0,
@@ -151,6 +167,10 @@ def test_markdown_reporter_basic(
     assert "Total Requests**: 5" in markdown_str
     assert "## Latency Metrics" in markdown_str
     assert "Avg TTFT | 20.00 ms" in markdown_str
+    assert "Avg ITL | 2.80 ms" in markdown_str
+    assert "Avg E2EL | 42.00 ms" in markdown_str
+    assert "Request Throughput | 5.00 req/s" in markdown_str
+    assert "Total Output Tokens | 800" in markdown_str
 
     # 验证文件写入
     assert output_file.exists()
@@ -177,6 +197,29 @@ def test_markdown_reporter_with_contract(
     assert "| ttft_ms | ✅ PASS |" in markdown_str
 
 
+def test_markdown_reporter_honest_degrades_missing_stream_metrics(tmp_path: Path) -> None:
+    output_file = tmp_path / "report_missing_stream.md"
+    metrics = AggregatedMetrics(
+        avg_ttft_ms=20.0,
+        p50_ttft_ms=20.0,
+        p95_ttft_ms=30.0,
+        p99_ttft_ms=30.0,
+        avg_tbt_ms=4.0,
+        avg_throughput_tps=80.0,
+        total_throughput_tps=100.0,
+        total_requests=5,
+        successful_requests=5,
+        peak_mem_mb=2048,
+    )
+
+    markdown_str = MarkdownReporter.generate(metrics=metrics, output_path=output_file)
+
+    assert "Avg ITL | N/A" in markdown_str
+    assert "Avg E2EL | N/A" in markdown_str
+    assert "Request Throughput | N/A" in markdown_str
+    assert output_file.exists()
+
+
 def test_table_reporter_plain_text(
     sample_aggregated_metrics: AggregatedMetrics,
     sample_contract_result: ContractResult,
@@ -198,6 +241,8 @@ def test_table_reporter_plain_text(
     assert "ttft_ms: PASS" in captured.out
     assert "Latency Metrics" in captured.out
     assert "Avg TTFT: 20.00 ms" in captured.out
+    assert "Avg ITL: 2.80 ms" in captured.out
+    assert "Avg E2EL: 42.00 ms" in captured.out
 
 
 def test_table_reporter_with_rich(

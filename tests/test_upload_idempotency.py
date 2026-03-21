@@ -19,7 +19,7 @@ def _entry(
     return {
         "entry_id": "test-entry",
         "sagellm_version": version,
-        "config_type": "single_chip",
+        "config_type": "single_gpu",
         "workload": {"name": workload},
         "model": {"name": "sshleifer/tiny-gpt2", "precision": "fp32"},
         "hardware": {"chip_model": "cpu", "chip_count": 1},

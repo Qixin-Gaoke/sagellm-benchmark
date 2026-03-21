@@ -97,6 +97,8 @@ class BenchmarkResult:
         output_text: 生成的文本输出。
         output_tokens: 输出 token 数。
         prompt_tokens: 输入 token 数。
+        is_warmup: 是否为 warmup 请求结果；聚合时默认排除。
+        batch_total_time_s: batch 模式下的统一墙钟总时长（秒）。
     """
 
     request_id: str
@@ -111,6 +113,11 @@ class BenchmarkResult:
     # 新增：benchmark 层面的延迟记录
     itl_list: list[float] = field(default_factory=list)  # 逐 token 延迟（ms）
     e2e_latency_ms: float = 0.0  # 端到端延迟（从发送到完成）
+    trace_id: str | None = None
+    error_code: str | None = None
+    protocol_surface: str | None = None
+    is_warmup: bool = False
+    batch_total_time_s: float = 0.0
 
 
 @dataclass

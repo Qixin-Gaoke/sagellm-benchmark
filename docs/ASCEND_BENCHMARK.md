@@ -224,9 +224,10 @@ curl http://127.0.0.1:8901/v1/models
 
 ```bash
 BATCH_SIZES=1,2,4 MAX_OUTPUT_TOKENS=64 REQUEST_TIMEOUT=180 \
-sagellm-benchmark vllm-compare run \
-  --vllm-url http://127.0.0.1:8000/v1 \
-  --sagellm-url http://127.0.0.1:8901/v1 \
+sagellm-benchmark compare \
+  --target vllm=http://127.0.0.1:8000/v1 \
+  --target sagellm=http://127.0.0.1:8901/v1 \
+  --hardware-family ascend \
   --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 

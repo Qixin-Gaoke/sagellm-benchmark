@@ -105,16 +105,17 @@ sagellm-benchmark 提供多种客户端，用于测试不同的 LLM 服务：
 跨引擎对比现在统一收敛到 `sagellm-benchmark`：
 
 1. 优先使用 `sagellm-benchmark compare` 对多个 OpenAI-compatible endpoint 做 live 对比。
-2. 对于标准 `sageLLM vs vLLM` 流程，优先使用更薄的 `sagellm-benchmark vllm-compare run` 包装入口。
+2. 对于标准 `sageLLM vs vLLM` 流程，也直接使用 `sagellm-benchmark compare`，固定 `sagellm` / `vllm` 标签即可。
 3. 若服务没有兼容 OpenAI 的 `/v1` 接口，再使用 benchmark Python client（如 `LMDeployClient`）补齐。
 4. `sagellm-core` 只保留 SageLLM 自身引擎能力与通用插件抽象，不再作为 vLLM/LMDeploy 对比入口。
 
 标准 `sageLLM vs vLLM` 推荐 CLI：
 
 ```bash
-sagellm-benchmark vllm-compare run \
-    --sagellm-url http://127.0.0.1:8901/v1 \
-    --vllm-url http://127.0.0.1:8000/v1 \
+sagellm-benchmark compare \
+    --target sagellm=http://127.0.0.1:8901/v1 \
+    --target vllm=http://127.0.0.1:8000/v1 \
+    --hardware-family cuda \
     --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
@@ -124,19 +125,21 @@ sagellm-benchmark vllm-compare run \
 cd sagellm-benchmark
 VLLM_GPU_DEVICE=1 VLLM_PORT=9100 ./scripts/start_vllm_cuda_docker.sh
 
-sagellm-benchmark vllm-compare run \
-    --sagellm-url http://127.0.0.1:8901/v1 \
-    --vllm-url http://127.0.0.1:9100/v1 \
+sagellm-benchmark compare \
+    --target sagellm=http://127.0.0.1:8901/v1 \
+    --target vllm=http://127.0.0.1:9100/v1 \
+    --hardware-family cuda \
     --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
 如果希望 compare 在 endpoint 缺失时自动把容器拉起：
 
 ```bash
-sagellm-benchmark vllm-compare run \
-    --sagellm-url http://127.0.0.1:8901/v1 \
-    --vllm-url http://127.0.0.1:9100/v1 \
-    --start-vllm-cmd "./scripts/start_vllm_cuda_docker.sh" \
+sagellm-benchmark compare \
+    --target sagellm=http://127.0.0.1:8901/v1 \
+    --target vllm=http://127.0.0.1:9100/v1 \
+    --target-command "vllm=./scripts/start_vllm_cuda_docker.sh" \
+    --hardware-family cuda \
     --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 

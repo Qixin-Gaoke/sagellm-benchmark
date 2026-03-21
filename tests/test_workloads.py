@@ -1,44 +1,79 @@
-"""Tests for workload definitions and selectors."""
+"""Tests for profile-first workload planning."""
 
 from __future__ import annotations
 
-from sagellm_benchmark.workloads import (
-    M1_WORKLOADS,
-    TPCH_WORKLOADS,
-    WorkloadQuery,
-    WorkloadType,
-    get_workloads_by_selector,
+import pytest
+
+from sagellm_benchmark.workload_profiles import (
+    MAINLINE_SCENARIO_SOURCE,
+    SUPPLEMENT_SCENARIO_SOURCE,
+    build_execution_plan,
 )
 
 
-def test_tpch_workloads_have_q1_q8_names() -> None:
-    """TPCH workload names should be Q1~Q8."""
-    names = [workload.name for workload in TPCH_WORKLOADS]
-    assert names == [query.value for query in WorkloadQuery]
+def test_profile_default_vllm_random_plan() -> None:
+    plan = build_execution_plan(
+        profile_id="vllm_random",
+        supplements=(),
+        dataset_path=None,
+        num_prompts=None,
+        input_len=None,
+        output_len=None,
+        batch_sizes=(1, 2, 4),
+        mode="live-compare",
+    )
+
+    assert plan.profile.profile_id == "vllm_random"
+    assert plan.profile.dataset_name == "random"
+    assert plan.profile.scenario_source == MAINLINE_SCENARIO_SOURCE
+    assert len(plan.scenarios) == 3
+    assert all(item.scenario_source == MAINLINE_SCENARIO_SOURCE for item in plan.scenarios)
 
 
-def test_tpch_workloads_use_query_type() -> None:
-    """All TPCH workloads should use QUERY workload type."""
-    assert all(workload.workload_type == WorkloadType.QUERY for workload in TPCH_WORKLOADS)
+def test_profile_custom_fail_fast_requires_all_fields() -> None:
+    with pytest.raises(ValueError, match="vllm_custom requires --dataset-path"):
+        build_execution_plan(
+            profile_id="vllm_custom",
+            supplements=(),
+            dataset_path=None,
+            num_prompts=8,
+            input_len=128,
+            output_len=128,
+            batch_sizes=(1,),
+            mode="live-compare",
+        )
 
 
-def test_selector_all_returns_all_query_workloads() -> None:
-    """Selector 'all' returns all query workloads."""
-    selected = get_workloads_by_selector("all")
-    assert len(selected) == len(TPCH_WORKLOADS)
-    assert [workload.name for workload in selected] == [
-        workload.name for workload in TPCH_WORKLOADS
+def test_profile_unknown_fails_fast() -> None:
+    with pytest.raises(ValueError, match="unknown profile_id"):
+        build_execution_plan(
+            profile_id="short",
+            supplements=(),
+            dataset_path=None,
+            num_prompts=None,
+            input_len=None,
+            output_len=None,
+            batch_sizes=(1,),
+            mode="live-compare",
+        )
+
+
+def test_q1q8_supplement_injection() -> None:
+    plan = build_execution_plan(
+        profile_id="vllm_random",
+        supplements=("q1q8_supplement",),
+        dataset_path=None,
+        num_prompts=None,
+        input_len=None,
+        output_len=None,
+        batch_sizes=(1,),
+        mode="live-compare",
+    )
+
+    # 1 mainline + 8 supplement scenarios at batch size 1
+    assert len(plan.scenarios) == 9
+    supplement_rows = [
+        row for row in plan.scenarios if row.scenario_source == SUPPLEMENT_SCENARIO_SOURCE
     ]
-
-
-def test_selector_q1_returns_single_workload() -> None:
-    """Selector Q1 should return only Q1 workload."""
-    selected = get_workloads_by_selector("Q1")
-    assert len(selected) == 1
-    assert selected[0].name == "Q1"
-
-
-def test_selector_legacy_m1_is_compatible() -> None:
-    """Legacy selector m1 should still work."""
-    selected = get_workloads_by_selector("m1")
-    assert selected == M1_WORKLOADS
+    assert len(supplement_rows) == 8
+    assert all(row.workload_profile == "vllm_random" for row in supplement_rows)

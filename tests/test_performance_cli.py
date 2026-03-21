@@ -5,21 +5,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
+from sagellm_protocol import Metrics, Timestamps
 
 from sagellm_benchmark.cli import (
+    _capture_target_runtime_artifacts,
     _display_perf_e2e_table,
     _display_results,
     _format_e2e_markdown,
     console,
     main,
 )
+from sagellm_benchmark.compare_runner import run_stream_compare_target
 from sagellm_benchmark.nonstream_compare import (
     NonStreamCompareConfig,
     NonStreamTarget,
     run_nonstream_compare,
 )
-from sagellm_benchmark.types import AggregatedMetrics
+from sagellm_benchmark.types import AggregatedMetrics, BenchmarkResult
+from sagellm_benchmark.workload_profiles import WorkloadScenarioPlan
 
 
 def test_perf_help():
@@ -31,6 +36,116 @@ def test_perf_help():
     assert "e2e" in result.output
     assert "--plot" in result.output
     assert "--plot-format" in result.output
+    assert "single-endpoint" in result.output
+    assert "cross-engine live benchmarks" in result.output
+
+
+def test_perf_live_rejects_multiple_models():
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "perf",
+            "--type",
+            "e2e",
+            "--live",
+            "--model",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--model",
+            "meta-llama/Llama-3.2-1B-Instruct",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "perf --live accepts exactly one --model" in result.output
+
+
+def test_stream_compare_runner_uses_chat_streaming_client_only(monkeypatch) -> None:
+    captured_endpoint_types: list[str] = []
+
+    class FakeGatewayClient:
+        def __init__(self, *, endpoint_type: str, **kwargs) -> None:
+            del kwargs
+            captured_endpoint_types.append(endpoint_type)
+
+        async def health_check(self, timeout: float = 5.0) -> bool:
+            del timeout
+            return True
+
+        async def discover_model(self, timeout: float = 5.0) -> str | None:
+            del timeout
+            return "Qwen/Qwen2.5-0.5B-Instruct"
+
+        async def generate_batch(self, requests, concurrent: bool = True):
+            del concurrent
+            assert requests, "chat streaming compare boundary broke: no requests were generated"
+            assert all(request.stream is True for request in requests), (
+                "chat streaming compare boundary broke: compare runner generated non-stream requests"
+            )
+            return [
+                BenchmarkResult(
+                    request_id=request.request_id,
+                    success=True,
+                    error=None,
+                    metrics=Metrics(
+                        ttft_ms=10.0,
+                        tbt_ms=2.0,
+                        tpot_ms=3.0,
+                        throughput_tps=100.0,
+                        peak_mem_mb=0,
+                        error_rate=0.0,
+                        timestamps=Timestamps(
+                            queued_at=1.0,
+                            scheduled_at=1.0,
+                            executed_at=1.01,
+                            completed_at=1.05,
+                        ),
+                        itl_list=[2.0, 2.0],
+                    ),
+                    output_text="ok",
+                    output_tokens=4,
+                    prompt_tokens=16,
+                    itl_list=[2.0, 2.0],
+                    e2e_latency_ms=50.0,
+                )
+                for request in requests
+            ]
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("sagellm_benchmark.compare_runner.GatewayClient", FakeGatewayClient)
+
+    rows, summary = run_stream_compare_target(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        backend_url="http://127.0.0.1:8901/v1",
+        batch_sizes=(1,),
+        api_key="sagellm-benchmark",
+        request_timeout=30.0,
+        server_wait_s=1.0,
+        max_seq_len_override=512,
+        max_output_tokens_override=32,
+        scenarios=(
+            WorkloadScenarioPlan(
+                scenario_name="vllm_random_b1",
+                scenario_source="mainline",
+                dataset_name="random",
+                dataset_path="builtin://random",
+                num_prompts=1,
+                input_len=128,
+                output_len=32,
+                batch_size=1,
+                workload_profile="vllm_random",
+                supplements=(),
+            ),
+        ),
+    )
+
+    assert captured_endpoint_types == ["chat"], (
+        "chat streaming compare boundary reopened: compare runner no longer constructs the "
+        "GatewayClient with endpoint_type='chat'"
+    )
+    assert rows[0]["transport"] == "stream"
+    assert summary["avg_ttft_ms"] == 10.0
 
 
 def test_perf_e2e_generates_files():
@@ -96,7 +211,7 @@ def test_report_accepts_perf_json():
 def test_compare_generates_files(monkeypatch):
     """Compare command should write per-target and summary artifacts."""
 
-    def fake_run_e2e_model_benchmarks(**kwargs):
+    def fake_run_stream_compare_target(**kwargs):
         backend_url = kwargs["backend_url"]
         if "8902" in backend_url:
             ttft = 10.0
@@ -106,26 +221,60 @@ def test_compare_generates_files(monkeypatch):
             ttft = 12.0
             tbt = 3.0
             tps = 90.0
-        return [
+        rows = [
             {
-                "model": kwargs["models"][0],
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": ttft,
                 "tbt_ms": tbt,
+                "tpot_ms": 5.0,
                 "throughput_tps": tps,
+                "output_throughput_tps": tps,
+                "request_throughput_rps": 1.0,
                 "latency_p50_ms": 20.0,
                 "latency_p95_ms": 25.0,
                 "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
                 "memory_mb": 0.0,
                 "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+                "scenario_source": "mainline",
+                "workload_profile": "vllm_random",
+                "supplements": [],
+                "dataset_name": "random",
             }
         ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": ttft,
+            "avg_tbt_ms": tbt,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": tps,
+            "avg_output_throughput_tps": tps,
+            "avg_request_throughput_rps": 1.0,
+        }
 
     monkeypatch.setattr(
-        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
-        fake_run_e2e_model_benchmarks,
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
     )
 
     runner = CliRunner()
@@ -141,20 +290,344 @@ def test_compare_generates_files(monkeypatch):
                 "vllm=http://127.0.0.1:8901/v1",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
                 "--output-dir",
                 str(output_dir),
             ],
         )
         assert result.exit_code == 0
         assert (output_dir / "sagellm.json").exists()
+        assert (output_dir / "sagellm.canonical.json").exists()
+        assert (output_dir / "sagellm.parity.json").exists()
+        assert (output_dir / "sagellm_leaderboard.json").exists()
         assert (output_dir / "vllm.json").exists()
+        assert (output_dir / "vllm.canonical.json").exists()
+        assert (output_dir / "vllm.parity.json").exists()
+        assert (output_dir / "vllm_leaderboard.json").exists()
         assert (output_dir / "comparison.json").exists()
+        assert (output_dir / "comparison.canonical.json").exists()
+        assert (output_dir / "leaderboard_manifest.json").exists()
+        assert (output_dir / "publish" / "website-ready" / "leaderboard_single.json").exists()
+        assert (output_dir / "publish" / "website-ready" / "leaderboard_multi.json").exists()
+        assert (output_dir / "publish" / "website-ready" / "leaderboard_compare.json").exists()
+        assert (output_dir / "publish" / "website-ready" / "last_updated.json").exists()
+
+        with open(output_dir / "sagellm.parity.json") as f:
+            parity_payload = json.load(f)
+        assert parity_payload["schema_version"] == "parity-run/v1"
+        assert parity_payload["hardware_family"] == "cuda"
+        assert parity_payload["scenarios"][0]["has_step_evidence"] is False
+
+        with open(output_dir / "sagellm.canonical.json") as f:
+            canonical_payload = json.load(f)
+        assert canonical_payload["schema_version"] == "canonical-benchmark-result/v2"
+        assert canonical_payload["artifact_kind"] == "execution_result"
+        assert canonical_payload["workload"]["workload_profile"] == "vllm_random"
+        assert canonical_payload["workload"]["scenario_source"] == "mainline"
+        assert canonical_payload["workload"]["dataset_name"] == "random"
+        assert canonical_payload["artifacts"]["leaderboard_json"].endswith(
+            "sagellm_leaderboard.json"
+        )
+
+        with open(output_dir / "sagellm_leaderboard.json") as f:
+            leaderboard_payload = json.load(f)
+        assert leaderboard_payload["schema_version"] == "leaderboard-export-entry/v2"
+        assert leaderboard_payload["engine"] == "sagellm"
+        assert leaderboard_payload["metadata"]["hardware_family"] == "cuda"
+        assert leaderboard_payload["metadata"]["idempotency_key"]
 
         with open(output_dir / "comparison.json") as f:
             payload = json.load(f)
         assert payload["kind"] == "compare"
         assert payload["baseline"] == "sagellm"
+        assert payload["workload_profile"] == "vllm_random"
+        assert payload["supplements"] == []
+        assert payload["dataset_name"] == "random"
+        assert payload["scenario_source"] == "mainline"
         assert len(payload["targets"]) == 2
+        assert json.loads((output_dir / "sagellm.json").read_text())["transport"] == "stream"
+        manifest = json.loads((output_dir / "leaderboard_manifest.json").read_text())
+        assert manifest["schema_version"] == "leaderboard-export-manifest/v2"
+        assert len(manifest["entries"]) == 2
+        compare_snapshot = json.loads(
+            (output_dir / "publish" / "website-ready" / "leaderboard_compare.json").read_text()
+        )
+        assert compare_snapshot["schema_version"] == "leaderboard-compare-snapshot/v1"
+        assert compare_snapshot["group_count"] >= 1
+
+
+def test_compare_forwards_profile_scenarios(monkeypatch):
+    captured_kwargs: list[dict[str, object]] = []
+
+    def fake_run_stream_compare_target(**kwargs):
+        captured_kwargs.append(kwargs)
+        return [
+            {
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
+                "precision": "live",
+                "scenario": "random_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
+                "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
+                "latency_p50_ms": 20.0,
+                "latency_p95_ms": 25.0,
+                "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
+                "memory_mb": 0.0,
+                "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+            }
+        ], {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("compare_random_out")
+        result = runner.invoke(
+            main,
+            [
+                "compare",
+                "--target",
+                "sagellm=http://127.0.0.1:8902/v1",
+                "--target",
+                "vllm=http://127.0.0.1:8901/v1",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
+                "--profile",
+                "vllm_random",
+                "--num-prompts",
+                "6",
+                "--input-len",
+                "512",
+                "--output-len",
+                "48",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(captured_kwargs) == 2
+    assert all("scenarios" in kwargs for kwargs in captured_kwargs)
+    assert all(
+        kwargs["scenarios"][0].workload_profile == "vllm_random" for kwargs in captured_kwargs
+    )
+    assert all(kwargs["scenarios"][0].num_prompts == 6 for kwargs in captured_kwargs)
+    assert all(kwargs["scenarios"][0].input_len == 512 for kwargs in captured_kwargs)
+    assert all(kwargs["scenarios"][0].output_len == 48 for kwargs in captured_kwargs)
+
+
+def test_compare_record_forwards_profile_scenarios(monkeypatch):
+    captured_kwargs: list[dict[str, object]] = []
+
+    def fake_run_stream_compare_target(**kwargs):
+        captured_kwargs.append(kwargs)
+        return [
+            {
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
+                "precision": "live",
+                "scenario": "sharegpt_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
+                "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
+                "latency_p50_ms": 20.0,
+                "latency_p95_ms": 25.0,
+                "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
+                "memory_mb": 0.0,
+                "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+            }
+        ], {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main,
+            [
+                "compare-record",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--profile",
+                "vllm_sharegpt",
+                "--num-prompts",
+                "5",
+                "--input-len",
+                "256",
+                "--output-len",
+                "32",
+                "--output-dir",
+                "capture_out",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["scenarios"][0].workload_profile == "vllm_sharegpt"
+    assert captured_kwargs[0]["scenarios"][0].num_prompts == 5
+    assert captured_kwargs[0]["scenarios"][0].input_len == 256
+    assert captured_kwargs[0]["scenarios"][0].output_len == 32
+
+
+def test_parity_gate_convert_core_telemetry_writes_normalized_artifact() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        input_path = Path("core_info.json")
+        output_path = Path("telemetry/core_telemetry.json")
+        input_path.write_text(
+            json.dumps(
+                {
+                    "performance_mainline": {
+                        "explicit_decode": {
+                            "feature_gate": {
+                                "feature_id": "runtime.native_decode.v1",
+                                "default_enabled": False,
+                                "enabled": True,
+                                "rollout_state": "on",
+                                "kill_switch_active": False,
+                            },
+                            "step_telemetry_schema_version": 1,
+                            "step_telemetry_stable_fields": [
+                                "trace_id",
+                                "request_id",
+                                "orchestration_step_id",
+                                "batch_id",
+                                "batch_type",
+                                "step_index",
+                                "batch_size",
+                                "active_sequences",
+                                "emitted_tokens",
+                                "step_latency_ms",
+                                "selected_implementation",
+                                "selected_operator_pack",
+                                "selection_interface_name",
+                                "telemetry_source",
+                            ],
+                            "step_telemetry": [
+                                {
+                                    "trace_id": "trace-1",
+                                    "request_id": "req-1",
+                                    "orchestration_step_id": 3,
+                                    "batch_id": 7,
+                                    "batch_type": "decode",
+                                    "step_index": 0,
+                                    "batch_size": 1,
+                                    "active_sequences": 1,
+                                    "emitted_tokens": 1,
+                                    "step_latency_ms": 0.6,
+                                    "selected_implementation": "torch-fallback",
+                                    "selected_operator_pack": "attention.decode",
+                                    "selection_interface_name": "attention_decode",
+                                    "telemetry_source": "step_trace",
+                                }
+                            ],
+                            "step_telemetry_entries": 1,
+                            "last_orchestration_step_id": 3,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            main,
+            [
+                "parity-gate",
+                "convert-core-telemetry",
+                "--input-json",
+                str(input_path),
+                "--label",
+                "sagellm-after",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
+                "--output",
+                str(output_path),
+            ],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == "core-decode-step-telemetry/v1"
+        assert payload["label"] == "sagellm-after"
+        assert payload["step_telemetry_entries"] == 1
+        assert payload["summary"]["step_records"] == 1
 
 
 def test_nonstream_compare_module_generates_files():
@@ -223,6 +696,247 @@ def test_nonstream_compare_module_generates_files():
         assert [target["label"] for target in payload["targets"]] == ["sagellm", "vllm"]
 
 
+def test_nonstream_compare_preserves_request_metrics() -> None:
+    """Non-stream compare should keep request-level latency/token compatibility fields."""
+
+    def fake_request(target, request_config):
+        del request_config
+        if target.label == "sagellm":
+            return {
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": 24.0,
+                "completion_text": "sage reply",
+                "finish_reason": "stop",
+                "prompt_tokens": 16,
+                "completion_tokens": 6,
+                "total_tokens": 22,
+                "raw_response": {"id": "sage-1"},
+            }
+        return {
+            "ok": True,
+            "status_code": 200,
+            "elapsed_ms": 12.0,
+            "completion_text": "vllm reply",
+            "finish_reason": "stop",
+            "prompt_tokens": 16,
+            "completion_tokens": 4,
+            "total_tokens": 20,
+            "raw_response": {"id": "vllm-1"},
+        }
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = run_nonstream_compare(
+            NonStreamCompareConfig(
+                targets=(
+                    NonStreamTarget("sagellm", "http://127.0.0.1:8901/v1"),
+                    NonStreamTarget("vllm", "http://127.0.0.1:8000/v1"),
+                ),
+                model="Qwen/Qwen2.5-0.5B-Instruct",
+                prompt="hello",
+                batch_sizes=(1,),
+                warmup_rounds=0,
+                rounds=1,
+                max_tokens=8,
+                temperature=0.0,
+                api_key="token",
+                request_timeout=10.0,
+                output_dir="nonstream_metrics_out",
+            ),
+            request_fn=fake_request,
+        )
+
+        sagellm_payload = json.loads((output_dir / "sagellm.json").read_text(encoding="utf-8"))
+        request = sagellm_payload["batches"][0]["requests"][0]
+
+        assert request["ttft_ms"] == 24.0
+        assert request["tpot_ms"] == 4.0
+        assert request["e2e_latency_ms"] == 24.0
+        assert request["throughput_tps"] == 250.0
+        assert request["raw_response"]["id"] == "sage-1"
+        assert sagellm_payload["summary"]["throughput_rps"] > 0
+
+
+def test_compare_record_and_compare_offline_preserve_stream_metrics(monkeypatch) -> None:
+    """compare-record/offline should preserve TTFT, ITL, TPOT, and E2EL fields."""
+
+    def fake_run_stream_compare_target(**kwargs):
+        backend_url = kwargs["backend_url"]
+        if "8901" in backend_url:
+            ttft = 11.0
+            tbt = 2.5
+            tpot = 4.5
+            itl = 1.8
+            e2el = 24.0
+            tps = 88.0
+            rps = 1.2
+        else:
+            ttft = 9.0
+            tbt = 2.0
+            tpot = 4.0
+            itl = 1.2
+            e2el = 19.0
+            tps = 96.0
+            rps = 1.4
+        rows = [
+            {
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
+                "precision": "live",
+                "scenario": "vllm_random_b1",
+                "batch_size": 1,
+                "ttft_ms": ttft,
+                "tbt_ms": tbt,
+                "tpot_ms": tpot,
+                "avg_itl_ms": itl,
+                "p50_itl_ms": itl,
+                "p95_itl_ms": itl + 0.3,
+                "p99_itl_ms": itl + 0.5,
+                "throughput_tps": tps,
+                "output_throughput_tps": tps,
+                "request_throughput_rps": rps,
+                "latency_p50_ms": e2el,
+                "latency_p95_ms": e2el + 3.0,
+                "latency_p99_ms": e2el + 5.0,
+                "avg_e2el_ms": e2el,
+                "memory_mb": 0.0,
+                "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+                "scenario_source": "mainline",
+                "workload_profile": "vllm_random",
+                "supplements": [],
+                "dataset_name": "random",
+            }
+        ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": ttft,
+            "avg_tbt_ms": tbt,
+            "avg_tpot_ms": tpot,
+            "avg_itl_ms": itl,
+            "p50_itl_ms": itl,
+            "p95_itl_ms": itl + 0.3,
+            "p99_itl_ms": itl + 0.5,
+            "avg_e2el_ms": e2el,
+            "avg_throughput_tps": tps,
+            "avg_output_throughput_tps": tps,
+            "avg_request_throughput_rps": rps,
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        sagellm_dir = Path("capture_sagellm")
+        vllm_dir = Path("capture_vllm")
+        sagellm_result = runner.invoke(
+            main,
+            [
+                "compare-record",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--output-dir",
+                str(sagellm_dir),
+            ],
+        )
+        assert sagellm_result.exit_code == 0
+
+        vllm_result = runner.invoke(
+            main,
+            [
+                "compare-record",
+                "--label",
+                "vllm",
+                "--url",
+                "http://127.0.0.1:8902/v1",
+                "--hardware-family",
+                "cuda",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--output-dir",
+                str(vllm_dir),
+            ],
+        )
+        assert vllm_result.exit_code == 0
+
+        sagellm_payload = json.loads((sagellm_dir / "sagellm.json").read_text(encoding="utf-8"))
+        sagellm_canonical = json.loads(
+            (sagellm_dir / "sagellm.canonical.json").read_text(encoding="utf-8")
+        )
+        sagellm_leaderboard = json.loads(
+            (sagellm_dir / "sagellm_leaderboard.json").read_text(encoding="utf-8")
+        )
+
+        assert sagellm_payload["summary"]["avg_ttft_ms"] == 11.0
+        assert sagellm_payload["summary"]["avg_itl_ms"] == 1.8
+        assert sagellm_payload["summary"]["avg_tpot_ms"] == 4.5
+        assert sagellm_payload["summary"]["avg_e2el_ms"] == 24.0
+        assert sagellm_canonical["metrics"]["itl_ms"] == 1.8
+        assert sagellm_canonical["metrics"]["e2el_ms"] == 24.0
+        assert sagellm_leaderboard["metrics"]["ttft_ms"] == 11.0
+        assert sagellm_leaderboard["metrics"]["itl_ms"] == 1.8
+        assert sagellm_leaderboard["metrics"]["tpot_ms"] == 4.5
+        assert sagellm_leaderboard["metrics"]["e2el_ms"] == 24.0
+
+        offline_dir = Path("offline_compare")
+        offline_result = runner.invoke(
+            main,
+            [
+                "compare-offline",
+                "--result",
+                f"sagellm={sagellm_dir / 'sagellm.json'}",
+                "--result",
+                f"vllm={vllm_dir / 'vllm.json'}",
+                "--output-dir",
+                str(offline_dir),
+            ],
+        )
+
+        assert offline_result.exit_code == 0
+        comparison_payload = json.loads(
+            (offline_dir / "comparison.json").read_text(encoding="utf-8")
+        )
+        comparison_canonical = json.loads(
+            (offline_dir / "comparison.canonical.json").read_text(encoding="utf-8")
+        )
+
+        assert comparison_payload["targets"][0]["avg_itl_ms"] == 1.8
+        assert comparison_payload["targets"][0]["avg_tpot_ms"] == 4.5
+        assert comparison_payload["targets"][0]["avg_e2el_ms"] == 24.0
+        assert comparison_payload["targets"][1]["avg_itl_ms"] == 1.2
+        assert comparison_payload["targets"][1]["delta_vs_baseline"]["itl_ms"] == pytest.approx(
+            -0.6
+        )
+        assert comparison_payload["targets"][1]["delta_vs_baseline"]["tpot_ms"] == pytest.approx(
+            -0.5
+        )
+        assert comparison_payload["targets"][1]["delta_vs_baseline"]["e2el_ms"] == -5.0
+        assert comparison_canonical["measurements"]["summary"]["targets"][0]["avg_itl_ms"] == 1.8
+        assert comparison_canonical["measurements"]["summary"]["targets"][1]["delta_vs_baseline"][
+            "itl_ms"
+        ] == pytest.approx(-0.6)
+
+
 def test_nonstream_compare_cli_invokes_module(monkeypatch):
     """CLI should forward parsed options into the reusable non-stream compare module."""
 
@@ -267,95 +981,60 @@ def test_nonstream_compare_cli_invokes_module(monkeypatch):
     assert config.output_dir == "compare_out"
 
 
-def test_vllm_compare_run_generates_files(monkeypatch):
-    """vllm-compare run should write the same compare artifacts with semantic labels."""
-
-    def fake_run_e2e_model_benchmarks(**kwargs):
-        backend_url = kwargs["backend_url"]
-        if "8901" in backend_url:
-            ttft = 11.0
-            tbt = 2.5
-            tps = 80.0
-        else:
-            ttft = 9.0
-            tbt = 1.5
-            tps = 95.0
-        return [
-            {
-                "model": kwargs["models"][0],
-                "precision": "live",
-                "scenario": "short_b1",
-                "batch_size": 1,
-                "ttft_ms": ttft,
-                "tbt_ms": tbt,
-                "throughput_tps": tps,
-                "latency_p50_ms": 20.0,
-                "latency_p95_ms": 25.0,
-                "latency_p99_ms": 30.0,
-                "memory_mb": 0.0,
-                "mode": "live",
-            }
-        ]
-
-    monkeypatch.setattr(
-        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
-        fake_run_e2e_model_benchmarks,
-    )
-
-    runner = CliRunner()
-    with runner.isolated_filesystem():
-        output_dir = Path("compare_out")
-        result = runner.invoke(
-            main,
-            [
-                "vllm-compare",
-                "run",
-                "--sagellm-url",
-                "http://127.0.0.1:8901/v1",
-                "--vllm-url",
-                "http://127.0.0.1:8000/v1",
-                "--model",
-                "Qwen/Qwen2.5-0.5B-Instruct",
-                "--output-dir",
-                str(output_dir),
-            ],
-        )
-        assert result.exit_code == 0
-        assert (output_dir / "sagellm.json").exists()
-        assert (output_dir / "vllm.json").exists()
-        assert (output_dir / "comparison.json").exists()
-
-        with open(output_dir / "comparison.json") as f:
-            payload = json.load(f)
-        assert payload["kind"] == "compare"
-        assert payload["baseline"] == "sagellm"
-        assert [target["label"] for target in payload["targets"]] == ["sagellm", "vllm"]
-
-
 def test_compare_record_generates_files(monkeypatch):
     """compare-record should write a single target payload for later offline compare."""
 
-    def fake_run_e2e_model_benchmarks(**kwargs):
-        return [
+    def fake_run_stream_compare_target(**kwargs):
+        rows = [
             {
-                "model": kwargs["models"][0],
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
                 "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
                 "latency_p50_ms": 20.0,
                 "latency_p95_ms": 25.0,
                 "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
                 "memory_mb": 0.0,
                 "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
             }
         ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
 
     monkeypatch.setattr(
-        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
-        fake_run_e2e_model_benchmarks,
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
     )
 
     runner = CliRunner()
@@ -369,6 +1048,8 @@ def test_compare_record_generates_files(monkeypatch):
                 "sagellm",
                 "--url",
                 "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
                 "--output-dir",
@@ -377,10 +1058,423 @@ def test_compare_record_generates_files(monkeypatch):
         )
         assert result.exit_code == 0
         assert (output_dir / "sagellm.json").exists()
+        assert (output_dir / "sagellm.parity.json").exists()
         with open(output_dir / "sagellm.json") as f:
             payload = json.load(f)
         assert payload["kind"] == "e2e"
         assert payload["label"] == "sagellm"
+        with open(output_dir / "sagellm.parity.json") as f:
+            parity_payload = json.load(f)
+        assert parity_payload["schema_version"] == "parity-run/v1"
+        assert parity_payload["model"] == "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def test_compare_record_auto_captures_core_telemetry_artifact(monkeypatch):
+    """compare-record should persist runtime artifacts when /info exposes core telemetry."""
+
+    def fake_run_stream_compare_target(**kwargs):
+        rows = [
+            {
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
+                "precision": "live",
+                "scenario": "vllm_random_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
+                "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
+                "latency_p50_ms": 20.0,
+                "latency_p95_ms": 25.0,
+                "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
+                "memory_mb": 0.0,
+                "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+            }
+        ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+
+    def fake_capture_target_runtime_artifacts(**kwargs):
+        output_dir = kwargs["output_dir"]
+        info_path = output_dir / "sagellm_info.json"
+        telemetry_path = output_dir / "sagellm_core_telemetry.json"
+        info_path.write_text('{"engine":"sagellm"}\n', encoding="utf-8")
+        telemetry_path.write_text(
+            '{"schema_version":"core-decode-step-telemetry/v1"}\n', encoding="utf-8"
+        )
+        return {
+            "info_json": str(info_path),
+            "core_telemetry_json": str(telemetry_path),
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        fake_capture_target_runtime_artifacts,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("capture_out")
+        result = runner.invoke(
+            main,
+            [
+                "compare-record",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert (output_dir / "sagellm_info.json").exists()
+        assert (output_dir / "sagellm_core_telemetry.json").exists()
+        payload = json.loads((output_dir / "sagellm.json").read_text())
+        assert payload["runtime_artifacts"]["info_json"].endswith("sagellm_info.json")
+        assert payload["runtime_artifacts"]["core_telemetry_json"].endswith(
+            "sagellm_core_telemetry.json"
+        )
+
+
+def test_validate_serving_consistency_writes_report(monkeypatch):
+    """validate-serving-consistency should persist a pass/fail report for one live target."""
+
+    def fake_run_compare_target(**kwargs):
+        output_dir = kwargs["output_dir"]
+        info_path = output_dir / "sagellm_info.json"
+        telemetry_path = output_dir / "sagellm_core_telemetry.json"
+        info_path.write_text(
+            json.dumps(
+                {
+                    "performance_mainline": {
+                        "decode_runtime_diagnostics": {
+                            "summary": {
+                                "primary_decode_attention_hit": True,
+                                "adjacent_decode_pack_hit": True,
+                                "attention_selected_implementation": "native-cuda",
+                                "attention_selected_operator_pack": "attention.decode.cuda.small_batch",
+                                "attention_first_failure_reason": None,
+                                "attention_batch_size": 1,
+                                "attention_native_kernel_hit": True,
+                                "attention_runtime_fallback": False,
+                                "adjacent_selected_implementation": "native-cuda-small-batch-pack",
+                                "adjacent_selected_operator_pack": "decode.step.small_batch",
+                                "adjacent_native_kernel_hit": True,
+                                "adjacent_runtime_fallback": False,
+                            }
+                        }
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        telemetry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "core-decode-step-telemetry/v1",
+                    "summary": {
+                        "batch_sizes": [1],
+                        "selected_implementations": ["native-cuda-small-batch-pack"],
+                        "selected_operator_packs": ["decode.step.small_batch"],
+                        "by_batch_size": [
+                            {
+                                "batch_size": 1,
+                                "step_records": 2,
+                                "unique_requests": 2,
+                                "avg_step_latency_ms": 0.6,
+                                "max_step_latency_ms": 0.7,
+                                "selected_implementations": ["native-cuda-small-batch-pack"],
+                                "selected_operator_packs": ["decode.step.small_batch"],
+                            }
+                        ],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "label": kwargs["label"],
+            "url": kwargs["url"],
+            "summary": {"avg_ttft_ms": 10.0, "avg_tbt_ms": 2.0, "avg_throughput_tps": 100.0},
+            "json": str(output_dir / "sagellm.json"),
+            "markdown": str(output_dir / "sagellm.md"),
+            "parity_json": str(output_dir / "sagellm.parity.json"),
+            "runtime_artifacts": {
+                "info_json": str(info_path),
+                "core_telemetry_json": str(telemetry_path),
+            },
+            "payload": {
+                "rows": [
+                    {
+                        "batch_size": 1,
+                        "successful_requests": 1,
+                        "failed_requests": 0,
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr("sagellm_benchmark.cli._run_compare_target", fake_run_compare_target)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("validate_out")
+        reference_path = Path("reference.json")
+        reference_path.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "1": {
+                            "attention_impl": "native-cuda",
+                            "selected_pack": "decode.step.small_batch",
+                        }
+                    },
+                    "raw": {
+                        "composite_step": {
+                            "1": {
+                                "after": {
+                                    "decode_runtime_diagnostics": {
+                                        "summary": {
+                                            "attention_selected_operator_pack": "attention.decode.cuda.small_batch",
+                                            "adjacent_selected_implementation": "native-cuda-small-batch-pack",
+                                            "adjacent_selected_operator_pack": "decode.step.small_batch",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            main,
+            [
+                "validate-serving-consistency",
+                "--label",
+                "sagellm",
+                "--url",
+                "http://127.0.0.1:8901/v1",
+                "--hardware-family",
+                "cuda",
+                "--reference-artifact",
+                str(reference_path),
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+
+        assert result.exit_code == 0
+        report_path = output_dir / "sagellm_runtime_consistency.json"
+        assert report_path.exists()
+        payload = json.loads(report_path.read_text())
+        assert payload["passed"] is True
+        assert payload["observed_batch_size"] == 1
+
+
+def test_capture_target_runtime_artifacts_supports_gateway_info_wrapper(monkeypatch, tmp_path):
+    """Gateway /info should still yield a core telemetry artifact when one engine is registered."""
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._fetch_json_probe",
+        lambda *args, **kwargs: {
+            "service": "sageLLM Gateway",
+            "registered_engines": [
+                {
+                    "engine_id": "engine-cuda-8902",
+                    "info": {
+                        "performance_mainline": {
+                            "explicit_decode": {
+                                "feature_gate": {
+                                    "feature_id": "runtime.native_decode.v1",
+                                    "default_enabled": False,
+                                    "enabled": True,
+                                    "rollout_state": "on",
+                                    "kill_switch_active": False,
+                                },
+                                "step_telemetry_schema_version": 1,
+                                "step_telemetry_stable_fields": [
+                                    "trace_id",
+                                    "request_id",
+                                    "orchestration_step_id",
+                                    "batch_id",
+                                    "batch_type",
+                                    "step_index",
+                                    "batch_size",
+                                    "active_sequences",
+                                    "emitted_tokens",
+                                    "step_latency_ms",
+                                    "selected_implementation",
+                                    "selected_operator_pack",
+                                    "selection_interface_name",
+                                    "telemetry_source",
+                                ],
+                                "step_telemetry": [
+                                    {
+                                        "trace_id": "trace-1",
+                                        "request_id": "req-1",
+                                        "orchestration_step_id": 1,
+                                        "batch_id": 1,
+                                        "batch_type": "decode",
+                                        "step_index": 0,
+                                        "batch_size": 1,
+                                        "active_sequences": 1,
+                                        "emitted_tokens": 1,
+                                        "step_latency_ms": 0.5,
+                                        "selected_implementation": "native-cuda-small-batch-pack",
+                                        "selected_operator_pack": "decode.step.small_batch",
+                                        "selection_interface_name": "decode_operator_pack",
+                                        "telemetry_source": "runtime_counter",
+                                    }
+                                ],
+                                "step_telemetry_entries": 1,
+                                "last_orchestration_step_id": 1,
+                            }
+                        }
+                    },
+                }
+            ],
+        },
+    )
+
+    runtime_artifacts = _capture_target_runtime_artifacts(
+        label="sagellm",
+        url="http://127.0.0.1:8901/v1",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        hardware_family="cuda",
+        api_key="sagellm-benchmark",
+        request_timeout=30.0,
+        output_dir=tmp_path,
+    )
+
+    assert runtime_artifacts["info_json"].endswith("sagellm_info.json")
+    assert runtime_artifacts["core_telemetry_json"].endswith("sagellm_core_telemetry.json")
+
+
+def test_compare_auto_captures_runtime_artifacts(monkeypatch):
+    """compare should include per-target runtime artifact references in target payloads."""
+
+    def fake_run_stream_compare_target(**kwargs):
+        rows = [
+            {
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
+                "precision": "live",
+                "scenario": "vllm_random_b1",
+                "batch_size": 1,
+                "ttft_ms": 10.0,
+                "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
+                "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
+                "latency_p50_ms": 20.0,
+                "latency_p95_ms": 25.0,
+                "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
+                "memory_mb": 0.0,
+                "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
+            }
+        ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+
+    def fake_capture_target_runtime_artifacts(**kwargs):
+        output_dir = kwargs["output_dir"]
+        label = kwargs["label"]
+        info_path = output_dir / f"{label}_info.json"
+        info_path.write_text(json.dumps({"label": label}) + "\n", encoding="utf-8")
+        return {"info_json": str(info_path)}
+
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        fake_capture_target_runtime_artifacts,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        output_dir = Path("compare_out")
+        result = runner.invoke(
+            main,
+            [
+                "compare",
+                "--target",
+                "sagellm=http://127.0.0.1:8902/v1",
+                "--target",
+                "vllm=http://127.0.0.1:8901/v1",
+                "--model",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+
+        assert result.exit_code == 0
+        sagellm_payload = json.loads((output_dir / "sagellm.json").read_text())
+        vllm_payload = json.loads((output_dir / "vllm.json").read_text())
+        assert sagellm_payload["runtime_artifacts"]["info_json"].endswith("sagellm_info.json")
+        assert vllm_payload["runtime_artifacts"]["info_json"].endswith("vllm_info.json")
 
 
 def test_compare_offline_generates_summary():
@@ -446,6 +1540,10 @@ def test_compare_passes_target_commands(monkeypatch):
         return Path("compare_out")
 
     monkeypatch.setattr("sagellm_benchmark.cli._run_compare_command", fake_run_compare_command)
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._prepare_compare_publish_ready_outputs",
+        lambda **kwargs: {},
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -462,61 +1560,29 @@ def test_compare_passes_target_commands(monkeypatch):
             "vllm=vllm serve --port 8000",
             "--model",
             "Qwen/Qwen2.5-0.5B-Instruct",
+            "--hardware-family",
+            "cuda",
         ],
     )
 
     assert result.exit_code == 0
+    assert captured["hardware_family"] == "cuda"
     assert captured["target_commands"] == {
         "sagellm": "sagellm serve --port 8902",
         "vllm": "vllm serve --port 8000",
     }
 
 
-def test_vllm_compare_run_passes_start_commands(monkeypatch):
-    """vllm-compare run should map convenience start flags into target command wiring."""
-
-    captured: dict[str, object] = {}
-
-    def fake_run_compare_command(**kwargs):
-        captured.update(kwargs)
-        return Path("compare_out")
-
-    monkeypatch.setattr("sagellm_benchmark.cli._run_compare_command", fake_run_compare_command)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "vllm-compare",
-            "run",
-            "--sagellm-url",
-            "http://127.0.0.1:8901/v1",
-            "--vllm-url",
-            "http://127.0.0.1:8000/v1",
-            "--start-sagellm-cmd",
-            "sagellm serve --port 8901",
-            "--start-vllm-cmd",
-            "vllm serve --port 8000",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert captured["target_commands"] == {
-        "sagellm": "sagellm serve --port 8901",
-        "vllm": "vllm serve --port 8000",
-    }
-
-
 def test_display_results_emphasizes_output_throughput() -> None:
     metrics = AggregatedMetrics(
-        avg_ttft_ms=20.0,
+        avg_ttft_ms=12.5,
         avg_tbt_ms=4.0,
         avg_throughput_tps=80.0,
         output_throughput_tps=320.0,
-        total_throughput_tps=360.0,
         input_throughput_tps=40.0,
         request_throughput_rps=12.0,
         total_requests=16,
+        successful_requests=16,
         failed_requests=0,
         peak_mem_mb=2048,
         total_input_tokens=400,
@@ -560,27 +1626,57 @@ def test_perf_e2e_summary_emphasizes_output_throughput() -> None:
 def test_compare_prompt_cleanup_kills_local_targets(monkeypatch):
     """compare should offer to kill local target processes when requested."""
 
-    def fake_run_e2e_model_benchmarks(**kwargs):
-        return [
+    def fake_run_stream_compare_target(**kwargs):
+        rows = [
             {
-                "model": kwargs["models"][0],
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
                 "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
                 "latency_p50_ms": 20.0,
                 "latency_p95_ms": 25.0,
                 "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
                 "memory_mb": 0.0,
                 "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
             }
         ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
 
     monkeypatch.setattr(
-        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
-        fake_run_e2e_model_benchmarks,
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
     )
     monkeypatch.setattr(
         "sagellm_benchmark.cli._discover_local_target_processes",
@@ -616,6 +1712,8 @@ def test_compare_prompt_cleanup_kills_local_targets(monkeypatch):
                 "vllm=http://127.0.0.1:8901/v1",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
                 "--prompt-cleanup",
             ],
             input="y\n",
@@ -630,27 +1728,57 @@ def test_compare_prompt_cleanup_kills_local_targets(monkeypatch):
 def test_compare_prompt_cleanup_can_leave_targets_running(monkeypatch):
     """compare should respect a negative cleanup confirmation."""
 
-    def fake_run_e2e_model_benchmarks(**kwargs):
-        return [
+    def fake_run_stream_compare_target(**kwargs):
+        rows = [
             {
-                "model": kwargs["models"][0],
+                "model": kwargs["model"],
+                "effective_model": kwargs["model"],
                 "precision": "live",
-                "scenario": "short_b1",
+                "scenario": "vllm_random_b1",
                 "batch_size": 1,
                 "ttft_ms": 10.0,
                 "tbt_ms": 2.0,
+                "tpot_ms": 5.0,
                 "throughput_tps": 100.0,
+                "output_throughput_tps": 100.0,
+                "request_throughput_rps": 1.0,
                 "latency_p50_ms": 20.0,
                 "latency_p95_ms": 25.0,
                 "latency_p99_ms": 30.0,
+                "avg_e2el_ms": 20.0,
                 "memory_mb": 0.0,
                 "mode": "live",
+                "transport": "stream",
+                "successful_requests": 1,
+                "failed_requests": 0,
             }
         ]
+        return rows, {
+            "total_rows": 1,
+            "avg_ttft_ms": 10.0,
+            "avg_tbt_ms": 2.0,
+            "avg_tpot_ms": 5.0,
+            "avg_itl_ms": 1.5,
+            "avg_e2el_ms": 20.0,
+            "avg_throughput_tps": 100.0,
+            "avg_output_throughput_tps": 100.0,
+            "avg_request_throughput_rps": 1.0,
+        }
 
     monkeypatch.setattr(
-        "sagellm_benchmark.performance.model_benchmarks.run_e2e_model_benchmarks",
-        fake_run_e2e_model_benchmarks,
+        "sagellm_benchmark.cli.run_stream_compare_target",
+        fake_run_stream_compare_target,
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._capture_target_runtime_artifacts",
+        lambda **kwargs: {
+            "info_json": "dummy-info.json",
+            "core_telemetry_json": "dummy-telemetry.json",
+        },
+    )
+    monkeypatch.setattr(
+        "sagellm_benchmark.cli._validate_sagellm_explicit_decode_runtime",
+        lambda **kwargs: None,
     )
     monkeypatch.setattr(
         "sagellm_benchmark.cli._discover_local_target_processes",
@@ -682,6 +1810,8 @@ def test_compare_prompt_cleanup_can_leave_targets_running(monkeypatch):
                 "vllm=http://127.0.0.1:8000/v1",
                 "--model",
                 "Qwen/Qwen2.5-0.5B-Instruct",
+                "--hardware-family",
+                "cuda",
                 "--prompt-cleanup",
             ],
             input="n\n",

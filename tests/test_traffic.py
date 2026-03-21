@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import statistics
+
 import pytest
 from test_helpers import StubClient
 
 from sagellm_benchmark.traffic import (
     ArrivalPattern,
+    RampUpStrategy,
     RequestGenerator,
     TrafficController,
     TrafficProfile,
@@ -53,6 +56,10 @@ def test_traffic_profile_defaults():
     assert profile.burstiness == 1.0
     assert profile.duration_s is None
     assert profile.warmup_requests == 0
+    assert profile.num_prompts is None
+    assert profile.ramp_up_strategy == RampUpStrategy.NONE
+    assert profile.ramp_up_requests == 0
+    assert profile.ramp_up_start_factor == 0.1
     assert profile.seed is None
 
 
@@ -64,6 +71,10 @@ def test_traffic_profile_custom_values():
         burstiness=0.5,
         duration_s=60.0,
         warmup_requests=5,
+        num_prompts=100,
+        ramp_up_strategy=RampUpStrategy.LINEAR,
+        ramp_up_requests=20,
+        ramp_up_start_factor=0.2,
         seed=42,
     )
     assert profile.pattern == ArrivalPattern.POISSON
@@ -71,7 +82,37 @@ def test_traffic_profile_custom_values():
     assert profile.burstiness == 0.5
     assert profile.duration_s == 60.0
     assert profile.warmup_requests == 5
+    assert profile.num_prompts == 100
+    assert profile.ramp_up_strategy == RampUpStrategy.LINEAR
+    assert profile.ramp_up_requests == 20
+    assert profile.ramp_up_start_factor == 0.2
     assert profile.seed == 42
+
+
+def test_traffic_profile_rate_normalization():
+    """测试 request_rate 归一化语义."""
+    assert TrafficProfile(request_rate=None).normalized_request_rate is None
+    assert TrafficProfile(request_rate=0.0).normalized_request_rate is None
+    assert TrafficProfile(request_rate=-3.0).normalized_request_rate is None
+    assert TrafficProfile(request_rate=float("inf")).normalized_request_rate is None
+    assert TrafficProfile(request_rate=12.5).normalized_request_rate == 12.5
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"request_rate": float("nan")}, "request_rate"),
+        ({"burstiness": 0.0}, "burstiness"),
+        ({"warmup_requests": -1}, "warmup_requests"),
+        ({"num_prompts": -1}, "num_prompts"),
+        ({"ramp_up_requests": -1}, "ramp_up_requests"),
+        ({"ramp_up_start_factor": 0.0}, "ramp_up_start_factor"),
+    ],
+)
+def test_traffic_profile_invalid_values(kwargs: dict[str, float | int], message: str):
+    """测试 TrafficProfile 边界校验."""
+    with pytest.raises(ValueError, match=message):
+        TrafficProfile(**kwargs)
 
 
 # ============================================================================
@@ -218,6 +259,22 @@ async def test_request_generator_zero_rate():
 
 
 @pytest.mark.asyncio
+async def test_request_generator_infinite_rate_normalized_to_unlimited():
+    """测试无限速率会归一化为不限速."""
+    requests = _create_test_requests(5)
+    profile = TrafficProfile(
+        pattern=ArrivalPattern.GAMMA,
+        request_rate=float("inf"),
+        burstiness=0.5,
+    )
+    generator = RequestGenerator(requests, profile)
+
+    delays = [delay async for delay, _ in generator]
+
+    assert delays == [0.0] * 5
+
+
+@pytest.mark.asyncio
 async def test_request_generator_reproducibility():
     """测试随机种子可复现性."""
     requests = _create_test_requests(5)
@@ -242,6 +299,72 @@ async def test_request_generator_reproducibility():
 
     # 应该完全相同
     assert delays1 == delays2, "Same seed should produce same delays"
+
+
+@pytest.mark.asyncio
+async def test_request_generator_gamma_burstiness_impacts_variance():
+    """测试 burstiness 会改变 Gamma 分布离散程度，但保持目标速率均值."""
+    requests = _create_test_requests(2000)
+    low_burst_profile = TrafficProfile(
+        pattern=ArrivalPattern.GAMMA,
+        request_rate=10.0,
+        burstiness=0.5,
+        seed=7,
+    )
+    high_burst_profile = TrafficProfile(
+        pattern=ArrivalPattern.GAMMA,
+        request_rate=10.0,
+        burstiness=5.0,
+        seed=7,
+    )
+
+    low_burst_delays = [delay async for delay, _ in RequestGenerator(requests, low_burst_profile)]
+    high_burst_delays = [delay async for delay, _ in RequestGenerator(requests, high_burst_profile)]
+
+    low_burst_std = statistics.pstdev(low_burst_delays)
+    high_burst_std = statistics.pstdev(high_burst_delays)
+    low_burst_avg = sum(low_burst_delays) / len(low_burst_delays)
+    high_burst_avg = sum(high_burst_delays) / len(high_burst_delays)
+
+    assert low_burst_std > high_burst_std
+    assert low_burst_avg == pytest.approx(0.1, rel=0.12)
+    assert high_burst_avg == pytest.approx(0.1, rel=0.08)
+
+
+@pytest.mark.asyncio
+async def test_request_generator_linear_ramp_up():
+    """测试 linear ramp-up 会逐步逼近目标 request_rate."""
+    requests = _create_test_requests(6)
+    profile = TrafficProfile(
+        pattern=ArrivalPattern.FIXED,
+        request_rate=10.0,
+        ramp_up_strategy=RampUpStrategy.LINEAR,
+        ramp_up_requests=4,
+        ramp_up_start_factor=0.25,
+    )
+
+    delays = [delay async for delay, _ in RequestGenerator(requests, profile)]
+
+    assert delays[0] == 0.0
+    assert delays[1:] == pytest.approx([0.4, 0.2, 0.1333333333, 0.1, 0.1], rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_request_generator_exponential_ramp_up():
+    """测试 exponential ramp-up 前期更保守，后期快速逼近目标 request_rate."""
+    requests = _create_test_requests(6)
+    profile = TrafficProfile(
+        pattern=ArrivalPattern.FIXED,
+        request_rate=10.0,
+        ramp_up_strategy=RampUpStrategy.EXPONENTIAL,
+        ramp_up_requests=4,
+        ramp_up_start_factor=0.125,
+    )
+
+    delays = [delay async for delay, _ in RequestGenerator(requests, profile)]
+
+    assert delays[0] == 0.0
+    assert delays[1:] == pytest.approx([0.8, 0.4, 0.2, 0.1, 0.1], rel=1e-6)
 
 
 # ============================================================================
@@ -334,6 +457,39 @@ async def test_traffic_controller_no_warmup():
 
     assert len(results) == 5
     assert all(r.success for r in results)
+
+
+@pytest.mark.asyncio
+async def test_traffic_controller_num_prompts_limit_applies_after_warmup():
+    """测试 num_prompts 只限制正式测试阶段请求数."""
+    client = StubClient(ttft_ms=10.0, tbt_ms=5.0)
+    profile = TrafficProfile(
+        pattern=ArrivalPattern.INSTANT,
+        warmup_requests=2,
+        num_prompts=3,
+    )
+    controller = TrafficController(client, profile)
+
+    requests = _create_test_requests(10)
+    results = await controller.run(requests)
+
+    assert len(results) == 3
+    assert [result.request_id for result in results] == ["req-2", "req-3", "req-4"]
+
+
+@pytest.mark.asyncio
+async def test_traffic_controller_zero_num_prompts_returns_empty_results():
+    """测试 num_prompts=0 时正式测试阶段直接返回空结果."""
+    client = StubClient(ttft_ms=10.0, tbt_ms=5.0)
+    profile = TrafficProfile(
+        pattern=ArrivalPattern.INSTANT,
+        num_prompts=0,
+    )
+    controller = TrafficController(client, profile)
+
+    results = await controller.run(_create_test_requests(5))
+
+    assert results == []
 
 
 @pytest.mark.asyncio

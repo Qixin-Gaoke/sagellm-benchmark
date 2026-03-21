@@ -9,6 +9,14 @@
 | 导入命名空间 | `sagellm_benchmark` |
 | 主要职责 | 性能基准测试套件（独立的 benchmark suite） |
 
+## 🚫 Python 环境约束（强制）
+
+- 永远不要创建 `.venv` 或 `venv`，也不要建议用户创建。
+- 永远不要执行 `python -m venv`、`uv venv`、`virtualenv`、`source .venv/bin/activate` 等命令。
+- 所有测试、lint、脚本执行必须复用当前已配置的 conda 环境。
+- 如需运行 Python 命令，优先使用当前已激活的 conda 环境或显式使用 `conda run -n sagellm ...`。
+- 如果脚本默认要求创建 virtualenv，必须跳过该步骤并继续使用现有 conda 环境。
+
 ## 🚨 核心开发原则
 
 ### Protocol-First（协议优先）
@@ -22,6 +30,17 @@
 ### Fail-Fast（快速失败）
 - ❌ **禁止** 静默回退、隐式默认值
 - ✅ **必须** 配置缺失时抛出明确错误
+
+## Ascend Compare 约束（强制）
+
+- `sagellm-benchmark` 是 `sageLLM vs vLLM / vllm-ascend` 标准 endpoint compare 的 owning repo；不要把 compare 依赖、安装矩阵、端点判活逻辑或启动剧本回灌到其他仓库。
+- 在 Ascend 机器上，`sagellm` 端点必须继续通过 `./scripts/sagellm_with_ascend_env.sh <command...>` 注入运行时环境后再启动。
+- 启动任一 Ascend compare 端点前，必须先做 smoke test：`import torch, torch_npu`、`torch.npu.is_available()`、`torch.npu.set_device('npu:0')`、一个最小 NPU tensor 运算。任何一步失败都必须 fail-fast。
+- 如果本机 Python 环境只有 `vllm-ascend` 而没有 `vllm` 主包，不要继续硬顶 `python -m vllm.entrypoints.openai.api_server`；先将其归类为环境矩阵或包布局问题。
+- 对于旧版或非目标 CANN 主机，例如 `8.1.RC1`，优先使用官方 Docker 容器路径运行 `vllm-ascend`，不要尝试把完整 `vllm + vllm-ascend` endpoint 栈装进主 `sagellm` 环境。
+- 标准容器入口优先使用：`bash scripts/run_vllm_ascend_container.sh start|status|logs|stop`。
+- 无论原生还是容器路径，compare 有效性的判定必须包含 4 项：端口监听、进程指纹、`/health`、`/v1/models`。缺任一项就判定为无效环境。
+- 不要把“端点已启动”和“benchmark compare 已完全可跑”混为一谈；若 benchmark 进程自己因 tokenizer 下载策略、`torch_npu` autoload 或 `/info` telemetry 校验而崩溃，必须明确标记为 benchmark-side blocker。
 
 ### Protocol Compliance（强制）
 - ✅ **必须** 所有实现遵循 Protocol v0.1（sagellm-docs/docs/specs/protocol_v0.1.md）

@@ -17,7 +17,7 @@ from pathlib import Path
 from sagellm_core import LLMEngine, LLMEngineConfig
 
 from sagellm_benchmark.runner import BenchmarkConfig, BenchmarkRunner
-from sagellm_benchmark.workloads import M1_WORKLOADS
+from sagellm_benchmark.workloads import TPCH_WORKLOADS
 
 
 async def run_batch_mode_example():
@@ -43,7 +43,7 @@ async def run_batch_mode_example():
     # 配置 benchmark（batch 模式）
     bench_config = BenchmarkConfig(
         engine=engine,
-        workloads=M1_WORKLOADS,
+        workloads=TPCH_WORKLOADS,
         output_dir=Path("./outputs/batch_mode_example"),
         verbose=True,
         mode="batch",  # Batch 模式
@@ -93,7 +93,7 @@ async def run_traffic_mode_example():
     # 配置 benchmark（traffic 模式）
     bench_config = BenchmarkConfig(
         engine=engine,
-        workloads=M1_WORKLOADS,
+        workloads=TPCH_WORKLOADS,
         output_dir=Path("./outputs/traffic_mode_example"),
         verbose=True,
         mode="traffic",  # Traffic 模式

@@ -12,24 +12,35 @@ Note: This is NOT OpenAI-specific. It's a generic client for
 OpenAI-protocol APIs. For sageLLM benchmarks, use this to
 connect to sagellm-gateway.
 
-Uses the official openai Python SDK.
+Uses direct HTTP/SSE requests for benchmark timing.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sagellm_benchmark.clients.base import BenchmarkClient
+from sagellm_benchmark.clients.openai_stream import OpenAIStreamBenchmarker
 
 if TYPE_CHECKING:
     from sagellm_benchmark.types import BenchmarkRequest, BenchmarkResult
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_hf_endpoint_defaults() -> None:
+    """Set benchmark-safe Hugging Face endpoint defaults before hub imports.
+
+    `transformers` / `huggingface_hub` may snapshot endpoint-related environment
+    variables during import, so benchmark code must initialize them before any
+    lazy model/tokenizer import path.
+    """
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 
 class GatewayClient(BenchmarkClient):
@@ -41,7 +52,7 @@ class GatewayClient(BenchmarkClient):
     Attributes:
         base_url: API base URL (e.g., http://localhost:8000/v1).
         api_key: API key (default: "sagellm-benchmark").
-        client: OpenAI async client instance.
+        endpoint_type: Streaming benchmark endpoint family. Only `chat` is supported.
     """
 
     def __init__(
@@ -49,6 +60,10 @@ class GatewayClient(BenchmarkClient):
         base_url: str = "http://localhost:8000/v1",
         api_key: str = "sagellm-benchmark",
         timeout: float = 60.0,
+        endpoint_type: str = "chat",
+        http_client: Any | None = None,
+        time_fn: Callable[[], float] | None = None,
+        zero_content_retry_attempts: int | None = None,
     ) -> None:
         """Initialize Gateway client.
 
@@ -58,24 +73,55 @@ class GatewayClient(BenchmarkClient):
             timeout: Request timeout (seconds).
 
         Raises:
-            ImportError: If openai package not installed.
+            ImportError: If httpx is not installed.
         """
         super().__init__(name="gateway", timeout=timeout)
 
         try:
-            from openai import AsyncOpenAI
+            import httpx
         except ImportError:
             raise ImportError(
-                "openai dependency missing. Reinstall benchmark base package with: "
+                "httpx dependency missing. Reinstall benchmark base package with: "
                 "pip install -U isagellm-benchmark"
+            )
+
+        if endpoint_type != "chat":
+            raise ValueError(
+                "Streaming benchmark only supports /v1/chat/completions. "
+                "/v1/completions with stream=true is outside the benchmark support boundary. "
+                f"Received endpoint_type={endpoint_type!r}."
             )
 
         self.base_url = base_url
         self.api_key = api_key
-        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.endpoint_type = endpoint_type
+        self._owns_http_client = http_client is None
+        self._http_client = http_client or httpx.AsyncClient(timeout=timeout)
         self._tokenizer_cache: dict[str, Any | None] = {}
+        if zero_content_retry_attempts is None:
+            zero_content_retry_attempts = int(
+                os.getenv("SAGELLM_BENCHMARK_STREAM_ZERO_CONTENT_RETRIES", "1")
+            )
+        if zero_content_retry_attempts < 0:
+            logger.warning(
+                "Received negative zero_content_retry_attempts=%s; clamping to 0",
+                zero_content_retry_attempts,
+            )
+            zero_content_retry_attempts = 0
+        self._stream_benchmarker = OpenAIStreamBenchmarker(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            endpoint_type=endpoint_type,
+            http_client=self._http_client,
+            time_fn=time_fn,
+            token_counter=self._count_text_tokens,
+            zero_content_retry_attempts=zero_content_retry_attempts,
+        )
 
-        logger.info(f"OpenAI client initialized: base_url={base_url}")
+        logger.info(
+            "Gateway client initialized: base_url=%s endpoint_type=%s", base_url, endpoint_type
+        )
 
     async def generate(self, request: BenchmarkRequest) -> BenchmarkResult:
         """Execute request via OpenAI API.
@@ -86,111 +132,7 @@ class GatewayClient(BenchmarkClient):
         Returns:
             Benchmark result with metrics.
         """
-        from sagellm_benchmark.types import BenchmarkResult
-
-        try:
-            from sagellm_protocol import Metrics
-        except ImportError:
-            logger.error("sagellm_protocol not installed")
-            return BenchmarkResult(
-                request_id=request.request_id,
-                success=False,
-                error="sagellm_protocol not installed",
-                metrics=None,
-            )
-
-        start_time = time.perf_counter()
-        first_token_time = None
-        streamed_chunks = 0
-
-        try:
-            # Build API request
-            api_kwargs: dict[str, Any] = {
-                "model": request.model,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "max_tokens": request.max_tokens,
-                "stream": True,  # Always stream for metrics collection
-            }
-
-            if request.temperature is not None:
-                api_kwargs["temperature"] = request.temperature
-            if request.top_p is not None:
-                api_kwargs["top_p"] = request.top_p
-
-            # Execute streaming request
-            output_text = ""
-            async for chunk in await self.client.chat.completions.create(**api_kwargs):
-                current_time = time.perf_counter()
-
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    output_text += content
-                    streamed_chunks += 1
-
-                    if first_token_time is None:
-                        first_token_time = current_time
-                        logger.debug(
-                            f"TTFT for {request.request_id}: "
-                            f"{(first_token_time - start_time) * 1000:.2f}ms"
-                        )
-
-            end_time = time.perf_counter()
-
-            # Calculate metrics
-            total_time_s = end_time - start_time
-            ttft_ms = (first_token_time - start_time) * 1000 if first_token_time else 0.0
-            output_tokens = self._count_text_tokens(output_text, request.model) or streamed_chunks
-            prompt_tokens = self._count_text_tokens(request.prompt, request.model)
-            if prompt_tokens <= 0:
-                prompt_tokens = len(request.prompt.split())
-
-            # Calculate TBT using real output token count when available.
-            if first_token_time is not None and output_tokens > 1:
-                tbt_ms = ((end_time - first_token_time) * 1000) / (output_tokens - 1)
-            else:
-                tbt_ms = 0.0
-
-            # TPOT (time per output token)
-            tpot_ms = (total_time_s * 1000 / output_tokens) if output_tokens > 0 else 0.0
-
-            # Throughput
-            throughput_tps = output_tokens / total_time_s if total_time_s > 0 else 0.0
-
-            # Create metrics (OpenAI API doesn't provide all metrics)
-            metrics = Metrics(
-                ttft_ms=ttft_ms,
-                tbt_ms=tbt_ms,
-                tpot_ms=tpot_ms,
-                throughput_tps=throughput_tps,
-                peak_mem_mb=0,
-                error_rate=0.0,
-                # Unavailable from OpenAI API
-                kv_used_tokens=0,
-                kv_used_bytes=0,
-                prefix_hit_rate=0.0,
-                evict_count=0,
-                evict_ms=0.0,
-                spec_accept_rate=0.0,
-            )
-
-            return BenchmarkResult(
-                request_id=request.request_id,
-                success=True,
-                error=None,
-                metrics=metrics,
-                output_text=output_text,
-                output_tokens=output_tokens,
-                prompt_tokens=prompt_tokens,
-            )
-
-        except Exception as e:
-            logger.error(f"OpenAI request {request.request_id} failed: {e}", exc_info=True)
-            return BenchmarkResult(
-                request_id=request.request_id,
-                success=False,
-                error=str(e),
-                metrics=None,
-            )
+        return await self._stream_benchmarker.benchmark(request)
 
     def _count_text_tokens(self, text: str, model_id: str) -> int:
         """Count real tokenizer tokens for benchmark accounting when tokenizer is available."""
@@ -215,6 +157,7 @@ class GatewayClient(BenchmarkClient):
         if model_id in self._tokenizer_cache:
             return self._tokenizer_cache[model_id]
 
+        _ensure_hf_endpoint_defaults()
         try:
             from transformers import AutoTokenizer
         except ImportError:
@@ -226,7 +169,6 @@ class GatewayClient(BenchmarkClient):
             return None
 
         tokenizer_source, local_only = self._resolve_tokenizer_source(model_id)
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_source,
@@ -297,11 +239,7 @@ class GatewayClient(BenchmarkClient):
         # Strip /v1 suffix to get server root
         root = base[:-3] if base.endswith("/v1") else base
 
-        try:
-            import httpx
-        except ImportError:
-            # Fall back to OpenAI SDK /v1/models probe
-            return await self._health_check_openai_sdk()
+        import httpx
 
         # 1. Try /health first (sagellm engine_server style)
         try:
@@ -325,16 +263,6 @@ class GatewayClient(BenchmarkClient):
 
         logger.error("All health check probes failed — server may not be ready")
         return False
-
-    async def _health_check_openai_sdk(self) -> bool:
-        """Fallback health check using the OpenAI SDK models.list()."""
-        try:
-            models = await asyncio.wait_for(self.client.models.list(), timeout=10.0)
-            logger.info(f"Health check OK ({len(list(models.data))} models available)")
-            return True
-        except Exception as e:
-            logger.error(f"SDK health check failed: {e}")
-            return False
 
     async def discover_model(self, timeout: float = 5.0) -> str | None:
         """Discover the model name loaded by the server.
@@ -388,5 +316,6 @@ class GatewayClient(BenchmarkClient):
 
     async def close(self) -> None:
         """Close HTTP client."""
-        await self.client.close()
-        logger.info("OpenAI client closed")
+        if self._owns_http_client:
+            await self._http_client.aclose()
+        logger.info("Gateway client closed")

@@ -292,7 +292,7 @@ def test_itl_aggregation() -> None:
 
 
 def test_empty_itl_list() -> None:
-    """测试空 ITL 列表不应导致异常。"""
+    """测试空 ITL 列表不应导致异常，且 E2EL 可从 timestamps 回退。"""
     results = [
         BenchmarkResult(
             request_id="r1",
@@ -314,7 +314,27 @@ def test_empty_itl_list() -> None:
     assert aggregated.p99_itl_ms == 0.0
     assert aggregated.std_itl_ms == 0.0
 
-    # E2EL 也为 0（过滤掉 <= 0 的样本）
+    # E2EL 会从 timestamps 回退计算
+    assert aggregated.avg_e2el_ms == pytest.approx(3000.0, abs=0.01)
+
+
+def test_e2el_without_explicit_value_or_timestamps_stays_zero() -> None:
+    """测试缺少显式 E2EL 且无 timestamps 时保持 0。"""
+    metrics = _create_sample_metrics().model_copy(update={"timestamps": None})
+    results = [
+        BenchmarkResult(
+            request_id="r1",
+            success=True,
+            error=None,
+            metrics=metrics,
+            itl_list=[],
+            e2e_latency_ms=0.0,
+            output_tokens=0,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
     assert aggregated.avg_e2el_ms == 0.0
 
 
@@ -383,6 +403,57 @@ def test_partial_itl_list() -> None:
 
     # E2EL 统计：[100.0, 80.0, 90.0] = 3 样本
     assert aggregated.avg_e2el_ms == pytest.approx(90.0, rel=0.01)
+
+
+def test_itl_falls_back_to_protocol_metrics_list() -> None:
+    """测试 BenchmarkResult.itl_list 为空时回退到 Protocol Metrics.itl_list。"""
+    metrics = _create_sample_metrics().model_copy(update={"itl_list": [7.0, 9.0, 8.0]})
+    results = [
+        BenchmarkResult(
+            request_id="r1",
+            success=True,
+            error=None,
+            metrics=metrics,
+            itl_list=[],
+            output_tokens=3,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
+    assert aggregated.avg_itl_ms == pytest.approx(8.0, abs=0.01)
+    assert aggregated.p95_itl_ms == 9.0
+
+
+def test_e2el_falls_back_to_timestamps() -> None:
+    """测试 e2e_latency_ms 缺失时从 timestamps 回退计算。"""
+    results = [
+        BenchmarkResult(
+            request_id="r1",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=10.0,
+                tbt_ms=2.0,
+                tpot_ms=2.5,
+                throughput_tps=100.0,
+                peak_mem_mb=1024,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=100.0,
+                    scheduled_at=100.1,
+                    executed_at=100.2,
+                    completed_at=100.5,
+                ),
+            ),
+            e2e_latency_ms=0.0,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
+    assert aggregated.avg_e2el_ms == pytest.approx(500.0, abs=0.01)
+    assert aggregated.p50_e2el_ms == pytest.approx(500.0, abs=0.01)
 
 
 # ==================== 新增：对标 vLLM/SGLang 吞吐量指标测试 ====================
@@ -603,6 +674,190 @@ def test_throughput_metrics_alignment() -> None:
     assert aggregated.input_throughput_tps > 0
     assert aggregated.output_throughput_tps > 0
     assert aggregated.total_throughput_tps > 0
+
+
+def test_throughput_metrics_zero_output_success() -> None:
+    """测试零输出成功请求不会污染输出吞吐，但仍计入请求/输入吞吐。"""
+    results = [
+        BenchmarkResult(
+            request_id="req-1",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=0.0,
+                tbt_ms=0.0,
+                tpot_ms=0.0,
+                throughput_tps=0.0,
+                peak_mem_mb=256,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=1000.0,
+                    scheduled_at=1000.0,
+                    executed_at=1000.0,
+                    completed_at=1002.0,
+                ),
+            ),
+            output_tokens=0,
+            prompt_tokens=40,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
+    assert aggregated.successful_requests == 1
+    assert aggregated.total_input_tokens == 40
+    assert aggregated.total_output_tokens == 0
+    assert aggregated.request_throughput_rps == pytest.approx(0.5, abs=0.01)
+    assert aggregated.input_throughput_tps == pytest.approx(20.0, abs=0.01)
+    assert aggregated.output_throughput_tps == 0.0
+    assert aggregated.total_throughput_tps == pytest.approx(20.0, abs=0.01)
+
+
+def test_batch_total_time_overrides_timestamp_window() -> None:
+    """测试 batch 模式优先使用统一总时长来计算吞吐。"""
+    results = [
+        BenchmarkResult(
+            request_id="req-1",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=10.0,
+                tbt_ms=2.0,
+                tpot_ms=2.5,
+                throughput_tps=50.0,
+                peak_mem_mb=1024,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=1000.0,
+                    scheduled_at=1000.1,
+                    executed_at=1000.2,
+                    completed_at=1008.0,
+                ),
+            ),
+            prompt_tokens=100,
+            output_tokens=50,
+            batch_total_time_s=4.0,
+        ),
+        BenchmarkResult(
+            request_id="req-2",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=12.0,
+                tbt_ms=2.0,
+                tpot_ms=2.5,
+                throughput_tps=60.0,
+                peak_mem_mb=1024,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=1001.0,
+                    scheduled_at=1001.1,
+                    executed_at=1001.2,
+                    completed_at=1009.0,
+                ),
+            ),
+            prompt_tokens=100,
+            output_tokens=50,
+            batch_total_time_s=4.0,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
+    assert aggregated.total_time_s == pytest.approx(4.0, abs=0.01)
+    assert aggregated.request_throughput_rps == pytest.approx(0.5, abs=0.01)
+    assert aggregated.input_throughput_tps == pytest.approx(50.0, abs=0.01)
+    assert aggregated.output_throughput_tps == pytest.approx(25.0, abs=0.01)
+    assert aggregated.total_throughput_tps == pytest.approx(75.0, abs=0.01)
+
+
+def test_batch_total_time_supports_legacy_private_attribute() -> None:
+    """测试聚合器兼容历史 _batch_total_time_s 私有字段。"""
+    result = BenchmarkResult(
+        request_id="req-1",
+        success=True,
+        error=None,
+        metrics=Metrics(
+            ttft_ms=10.0,
+            tbt_ms=2.0,
+            tpot_ms=2.5,
+            throughput_tps=50.0,
+            peak_mem_mb=1024,
+            error_rate=0.0,
+            timestamps=Timestamps(
+                queued_at=1000.0,
+                scheduled_at=1000.1,
+                executed_at=1000.2,
+                completed_at=1010.0,
+            ),
+        ),
+        prompt_tokens=30,
+        output_tokens=10,
+    )
+    result._batch_total_time_s = 2.0
+
+    aggregated = MetricsAggregator.aggregate([result])
+
+    assert aggregated.total_time_s == pytest.approx(2.0, abs=0.01)
+    assert aggregated.total_throughput_tps == pytest.approx(20.0, abs=0.01)
+
+
+def test_warmup_results_are_excluded_from_aggregation() -> None:
+    """测试 warmup 结果不会进入正式聚合统计。"""
+    results = [
+        BenchmarkResult(
+            request_id="warmup-1",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=500.0,
+                tbt_ms=100.0,
+                tpot_ms=100.0,
+                throughput_tps=1.0,
+                peak_mem_mb=1024,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=900.0,
+                    scheduled_at=900.1,
+                    executed_at=900.2,
+                    completed_at=905.0,
+                ),
+            ),
+            prompt_tokens=1000,
+            output_tokens=1000,
+            is_warmup=True,
+        ),
+        BenchmarkResult(
+            request_id="measured-1",
+            success=True,
+            error=None,
+            metrics=Metrics(
+                ttft_ms=20.0,
+                tbt_ms=4.0,
+                tpot_ms=5.0,
+                throughput_tps=50.0,
+                peak_mem_mb=1024,
+                error_rate=0.0,
+                timestamps=Timestamps(
+                    queued_at=1000.0,
+                    scheduled_at=1000.1,
+                    executed_at=1000.2,
+                    completed_at=1002.0,
+                ),
+            ),
+            prompt_tokens=100,
+            output_tokens=20,
+        ),
+    ]
+
+    aggregated = MetricsAggregator.aggregate(results)
+
+    assert aggregated.total_requests == 1
+    assert aggregated.successful_requests == 1
+    assert aggregated.failed_requests == 0
+    assert aggregated.avg_ttft_ms == pytest.approx(20.0, abs=0.01)
+    assert aggregated.total_input_tokens == 100
+    assert aggregated.total_output_tokens == 20
 
 
 def test_throughput_fields_presence() -> None:

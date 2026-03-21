@@ -1,11 +1,11 @@
-"""E2E model-level benchmarks for sagellm-benchmark (#45/#46)."""
+"""E2E single-endpoint model benchmarks for sagellm-benchmark (#45/#46)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
+import time
 from dataclasses import dataclass
 from hashlib import sha256
 from statistics import mean
@@ -40,9 +40,12 @@ def run_e2e_model_benchmarks(
     Uses deterministic simulation mode by default to keep CI stable.
     In live mode (simulate=False), sends real requests to an OpenAI-compatible
     API server (e.g., sagellm-gateway or sagellm-core engine_server).
+    This path is intentionally scoped to a single endpoint; cross-engine live
+    benchmarking belongs to ``compare`` / ``vllm-compare``.
 
     Args:
-        models: List of model names/paths to benchmark.
+        models: List of model names/paths to benchmark. Live mode should receive
+            exactly one model label because the endpoint serves one model at a time.
         batch_sizes: List of batch sizes to test.
         precisions: Precision labels (simulation only; live mode uses server precision).
         simulate: If True, use deterministic simulation. If False, run live requests.
@@ -64,8 +67,8 @@ def run_e2e_model_benchmarks(
     for batch_size in batch_sizes:
         scenarios.extend(
             [
-                Scenario(f"short_b{batch_size}", 128, 128, batch_size),
-                Scenario(f"long_b{batch_size}", 2048, 512, batch_size),
+                Scenario(f"vllm_random_b{batch_size}", 128, 128, batch_size),
+                Scenario(f"vllm_sharegpt_b{batch_size}", 256, 128, batch_size),
             ]
         )
 
@@ -122,6 +125,7 @@ def run_e2e_model_benchmarks(
                             "ttft_ms": ttft,
                             "tbt_ms": tbt,
                             "throughput_tps": throughput,
+                            "output_throughput_tps": throughput * scenario.batch_size,
                             "latency_p50_ms": _percentile(latencies, 50),
                             "latency_p95_ms": _percentile(latencies, 95),
                             "latency_p99_ms": _percentile(latencies, 99),
@@ -189,12 +193,15 @@ async def _discover_max_seq_len(
 
     # 2. transformers AutoConfig (works for local paths and cached HF models)
     try:
+        from sagellm_benchmark.clients.openai_client import (
+            GatewayClient,
+            _ensure_hf_endpoint_defaults,
+        )
+
+        _ensure_hf_endpoint_defaults()
         from transformers import AutoConfig  # type: ignore[import-untyped]
 
-        from sagellm_benchmark.clients.openai_client import GatewayClient
-
         config_source, local_only = GatewayClient._resolve_tokenizer_source(model_path)
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         cfg = AutoConfig.from_pretrained(
             config_source,
             trust_remote_code=True,
@@ -233,6 +240,8 @@ async def _run_live_benchmarks(
     max_output_tokens_override: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run live E2E benchmarks against a real API server.
+
+    This is a single-endpoint sampling path. It is not a cross-engine compare runner.
 
     Args:
         models: Model names/paths to benchmark.
@@ -405,7 +414,9 @@ async def _run_live_scenario(
         for i in range(scenario.batch_size)
     ]
 
+    started_at = time.perf_counter()
     results = await client.generate_batch(requests, concurrent=True)
+    wall_time_s = max(time.perf_counter() - started_at, 1e-9)
 
     # Aggregate per-request metrics
     ttft_values: list[float] = []
@@ -431,6 +442,8 @@ async def _run_live_scenario(
     avg_ttft = mean(ttft_values) if ttft_values else 0.0
     avg_tbt = mean(tbt_values) if tbt_values else 0.0
     avg_throughput = mean(throughput_values) if throughput_values else 0.0
+    total_output_tokens = sum(result.output_tokens for result in results if result.success)
+    output_throughput_tps = total_output_tokens / wall_time_s if successful else 0.0
 
     logger.info(
         f"Scenario {scenario.name}: {successful}/{len(results)} ok, "
@@ -446,6 +459,7 @@ async def _run_live_scenario(
         "ttft_ms": avg_ttft,
         "tbt_ms": avg_tbt,
         "throughput_tps": avg_throughput,
+        "output_throughput_tps": output_throughput_tps,
         "latency_p50_ms": _percentile(e2e_latencies, 50),
         "latency_p95_ms": _percentile(e2e_latencies, 95),
         "latency_p99_ms": _percentile(e2e_latencies, 99),
@@ -479,4 +493,9 @@ def summarize_e2e_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_ttft_ms": mean(row["ttft_ms"] for row in rows) if rows else 0.0,
         "avg_tbt_ms": mean(row["tbt_ms"] for row in rows) if rows else 0.0,
         "avg_throughput_tps": mean(row["throughput_tps"] for row in rows) if rows else 0.0,
+        "avg_output_throughput_tps": (
+            mean(row.get("output_throughput_tps", row["throughput_tps"]) for row in rows)
+            if rows
+            else 0.0
+        ),
     }

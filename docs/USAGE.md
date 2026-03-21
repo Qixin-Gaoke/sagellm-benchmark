@@ -10,17 +10,32 @@ pip install isagellm-benchmark
 
 ### 2. Run Benchmark
 
-The easiest way is to use the one-click script:
+推荐优先直接使用 CLI 主链路：
+
+```bash
+# Canonical local workload benchmark path
+sagellm-benchmark run --workload all --backend cpu
+
+# Canonical live endpoint compare path
+sagellm-benchmark compare \
+  --target sagellm=http://127.0.0.1:8902/v1 \
+  --target vllm=http://127.0.0.1:8901/v1 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --hardware-family cuda
+```
+
+`run_benchmark.sh` 仍保留，但只作为兼容 shell wrapper：
 
 ```bash
 ./run_benchmark.sh
 ```
 
 This will:
-- Run all three M1 workloads (short/long/stress)
+- Reuse `sagellm-benchmark run`
+- Run the default Q1-Q8 local workload suite
 - Generate metrics JSON files
-- Create summary report
-- Generate markdown report
+- Generate canonical artifacts first
+- Generate leaderboard exports only as compatibility artifacts
 
 ## CLI Reference
 
@@ -69,15 +84,14 @@ sagellm-benchmark compare \
 
 ### `sagellm-benchmark run`
 
-Run benchmark workloads.
+Canonical local workload benchmark pipeline.
 
 **Options:**
 
--- `--workload`: Workload type to run
-  - `m1`: All three workloads (default)
-  - `short`: Short input only
-  - `long`: Long input only
-  - `stress`: Stress test only
+- `--workload`: Workload selector
+  - `all`: Full Q1-Q8 suite
+  - `Q1` ... `Q8`: Single workload
+  - `query`, `streaming`, `batch`, `mixed`: grouped selectors
 
 -- `--backend`: Backend engine to use
   - `cpu`: CPU inference with HuggingFace (default)
@@ -102,25 +116,22 @@ Run benchmark workloads.
 **Examples:**
 
 ```bash
-# Run all workloads with CPU backend (traffic mode)
-sagellm-benchmark run --workload m1 --backend cpu
+# Run the full Q1-Q8 suite with CPU backend (traffic mode)
+sagellm-benchmark run --workload all --backend cpu
 
-# Run in batch mode for offline throughput testing (vLLM/SGLang compatible)
-sagellm-benchmark run --workload m1 --backend cpu --mode batch
+# Run in batch mode for offline throughput testing
+sagellm-benchmark run --workload all --backend cpu --mode batch
 
-# Run short input with CPU backend
-sagellm-benchmark run --workload short --backend cpu --model sshleifer/tiny-gpt2
+# Run a single workload
+sagellm-benchmark run --workload Q1 --backend cpu --model sshleifer/tiny-gpt2
 
-# Run stress test with verbose output and custom JSON output
-sagellm-benchmark run --workload stress --backend cpu -v -o ./my_results --output-json ./results.json
-
-# Batch mode with custom output
-sagellm-benchmark run --workload m1 --backend cpu --mode batch --output-json ./batch_results.json
+# Custom output directory and JSON mirror
+sagellm-benchmark run --workload Q4 --backend cpu -v -o ./my_results --output-json ./results.json
 ```
 
 ### `sagellm-benchmark report`
 
-Generate report from benchmark results.
+Generate helper reports from existing benchmark artifacts. This is not a benchmark execution mainline.
 
 **Options:**
 

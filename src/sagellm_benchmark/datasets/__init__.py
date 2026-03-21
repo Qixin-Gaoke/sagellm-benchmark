@@ -18,6 +18,11 @@ from __future__ import annotations
 
 from sagellm_benchmark.datasets.base import BenchmarkDataset
 from sagellm_benchmark.datasets.random import RandomDataset
+from sagellm_benchmark.datasets.serving import (
+    SERVING_DATASET_NAMES,
+    build_serving_requests,
+    load_serving_dataset,
+)
 from sagellm_benchmark.datasets.sharegpt import ShareGPTDataset, SyntheticShareGPTDataset
 from sagellm_benchmark.datasets.year_demo import (
     YEAR1_LONG,
@@ -47,6 +52,9 @@ __all__ = [
     "RandomDataset",
     "ShareGPTDataset",
     "SyntheticShareGPTDataset",
+    "SERVING_DATASET_NAMES",
+    "load_serving_dataset",
+    "build_serving_requests",
     # Year Demo Workloads
     "YEAR1_WORKLOADS",
     "YEAR1_SHORT",
