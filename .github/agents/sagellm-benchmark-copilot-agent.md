@@ -81,8 +81,8 @@
 - ✅ **必须** 每次解决一个 issue 时更新 `CHANGELOG.md`
 - ✅ **必须** 在 `[Unreleased]` 部分添加本次改动
 - ✅ **必须** 使用正确的分类（Added/Changed/Fixed/Removed）
-- ✅ **每次** `git push` 到 `main-dev` 默认**不会**触发 PyPI 发布
-- ✅ **只有显式使用** `git push -o sagellm-publish origin main-dev` 才会触发发布；若 push option 不可用，则使用 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main-dev`
+- ✅ **每次** `git push` 到 `main` 默认**不会**触发 PyPI 发布
+- ✅ **只有显式使用** `git push -o sagellm-publish origin main` 才会触发发布；若 push option 不可用，则使用 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main`
 - ✅ **显式触发发布时** 会同步更新版本号并生成 release tag
 - ✅ **发布时** `[Unreleased]` 自动替换为版本号与日期
 
@@ -122,8 +122,8 @@ vim CHANGELOG.md
 git add .
 git commit -m "fix: resolve issue #123"
 
-# 4. 如需发布，显式带发布 flag 推送到 main-dev
-git push -o sagellm-publish origin main-dev
+# 4. 如需发布，显式带发布 flag 推送到 main
+git push -o sagellm-publish origin main
 ```
 
 ## 📦 PyPI 发布流程
@@ -280,15 +280,15 @@ gh issue create \
 
 2. **开发修复** - 在本地分支解决问题
    ```bash
-   git fetch origin main-dev
-   git checkout -b fix/#123-short-description origin/main-dev
+   git fetch origin main
+   git checkout -b fix/#123-short-description origin/main
 
    # 进行开发，确保测试通过
    ruff format .
    ruff check . --fix
    pytest -v
    ```
-   - **必须** 从 `main-dev` 分支创建开发分支
+   - **必须** 从 `main` 分支创建开发分支
    - **必须** 分支名包含 issue 号：`fix/#123-xxx` 或 `feature/#456-xxx`
    - **必须** 在提交前通过所有测试和 lint 检查
    - **必须** 更新 CHANGELOG.md
@@ -297,17 +297,17 @@ gh issue create \
    ```bash
    git push origin fix/#123-short-description
    gh pr create \
-     --base main-dev \
+     --base main \
      --head fix/#123-short-description \
      --title "Fix: [简短描述]"
    ```
-   - **必须** 针对 `main-dev` 分支发起 PR
+   - **必须** 针对 `main` 分支发起 PR
    - **必须** 代码必须通过所有 CI 检查
 
-4. **代码审查与合并** - 等待审批后合并到 main-dev
+4. **代码审查与合并** - 等待审批后合并到 main
    - **必须** 至少一名维护者审批才能合并
    - **必须** CI 检查全部通过
-   - **必须** 合并到 `main-dev` 分支
+   - **必须** 合并到 `main` 分支
 
 ## 相关文档
 
