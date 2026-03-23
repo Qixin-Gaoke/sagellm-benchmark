@@ -718,18 +718,18 @@ mypy src/
 
 2. **开发修复** - 在本地 `fix/#123-xxx` 分支解决
    ```bash
-   git checkout -b fix/#123-xxx origin/main-dev
+   git checkout -b fix/#123-xxx origin/main
    # 开发、测试...
    pytest -v
    ruff format . && ruff check . --fix
    ```
 
-3. **发起 PR** - 提交到 `main-dev` 分支
+3. **发起 PR** - 提交到 `main` 分支
    ```bash
-   gh pr create --base main-dev --title "Fix: 描述" --body "Closes #123"
+   gh pr create --base main --title "Fix: 描述" --body "Closes #123"
    ```
 
-4. **合并** - 审批后合并到 `main-dev`
+4. **合并** - 审批后合并到 `main`
 
 更多详情见 [.github/copilot-instructions.md](.github/copilot-instructions.md)
 

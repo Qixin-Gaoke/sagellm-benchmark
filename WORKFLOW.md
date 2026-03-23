@@ -30,7 +30,7 @@ sagellm-benchmark aggregate
 # 只提交 hf_data/ 目录
 git add hf_data/
 git commit -m "feat: add Qwen2-7B benchmark results"
-git push origin main-dev
+git push origin main
 ```
 
 **✅ 完成！后续都是自动的。**

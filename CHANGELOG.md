@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/ASCEND_BENCHMARK.md` 去掉了“当前主环境已默认跑通本地 endpoint compare 并固化结果”的误导性表述，改为记录真实的专用环境策略、已观测 resolver 冲突，以及官方矩阵的使用方式。
 - 新增 `scripts/run_vllm_ascend_container.sh`，支持使用官方 `vllm-ascend` Docker 镜像通过 `start/status/logs/stop` 管理容器化 endpoint，并自动做设备映射与 `/v1/models` 判活。
 - `scripts/setup_vllm_ascend_compare_env.sh` 不再硬编码 `/opt/miniconda3/envs/bench-vllm-ascend/bin/python`；现在优先使用 `BENCH_VLLM_ASCEND_PY`，否则使用当前已激活的非 `base` conda 环境，并支持通过 `SAGELLM_ASCEND_TOOLKIT_HOME` 适配非标准 Ascend toolkit 布局。
-- `hooks/pre-push` 默认不再因检测到发布凭证而自动发布；只有显式使用 `git push -o sagellm-publish origin main-dev` 或 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main-dev` 时才会触发发布。
+- `hooks/pre-push` 默认不再因检测到发布凭证而自动发布；只有显式使用 `git push -o sagellm-publish origin main` 或 `SAGELLM_PUBLISH_ON_PUSH=1 git push origin main` 时才会触发发布。
 - `hooks/post-commit` 默认不再在每次提交后自动 bump 版本；普通 `git push` 也不再触发 PyPI 版本冲突检查，只有显式发布时才会处理版本号。
 - `compare` 现支持 `--target-command LABEL=COMMAND`，`vllm-compare run` 现支持 `--start-sagellm-cmd` / `--start-vllm-cmd`：当本地 endpoint 未启动时可由 benchmark 先拉起服务、等待就绪，再执行对比；若这些进程由 benchmark 启动，则 cleanup prompt 会优先按其独立进程组做精确回收。
 - `compare` / `vllm-compare run` 现支持在交互式终端中于评测完成后提示是否清理本地 endpoint 对应进程；可通过 `--prompt-cleanup` / `--no-prompt-cleanup` 显式控制，避免本地 benchmark 跑完后遗留 SageLLM / vLLM 服务常驻。
