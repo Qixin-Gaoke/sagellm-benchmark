@@ -3,7 +3,7 @@
 #
 # Flow:
 #   1. Block direct push to main branch
-#   2. Only proceed for main-dev pushes (other branches: skip cleanly)
+#   2. Run checks for branch pushes (tags/non-branch refs skip cleanly)
 #   3. If publish is requested and the version already exists on PyPI, bump BUILD digit
 #   4. Exit 0 → git push proceeds immediately
 #   5. Background job publishes to PyPI after push finishes only when publish is explicitly requested
@@ -32,24 +32,30 @@ WANT_PUBLISH=false
 REPO_DIR="$(pwd)"
 REPO_NAME="$(basename "$REPO_DIR")"
 PUBLISH_LOG="/tmp/${REPO_NAME}-publish-$$.log"
-PUSHING_MAIN_DEV=false
+PUSHING_BRANCH_PUSH=false
+PUSH_TARGET_BRANCH=""
 PUSH_LOCAL_SHA=""
 
-# --- Block direct push to main; detect main-dev push ---
+# --- Block direct push to main; detect branch push ---
 while read -r local_ref local_sha remote_ref remote_sha; do
     if [ "$local_ref" = "refs/heads/main" ] || [ "$remote_ref" = "refs/heads/main" ]; then
         echo -e "${RED}✗ Direct push to main is forbidden${NC}"
-        echo -e "${YELLOW}  Please push to main-dev first, then merge via PR.${NC}"
+        echo -e "${YELLOW}  Please push a feature branch, then merge via PR to main.${NC}"
         exit 1
     fi
-    if [ "$local_ref" = "refs/heads/main-dev" ] || [ "$remote_ref" = "refs/heads/main-dev" ]; then
-        PUSHING_MAIN_DEV=true
+    if [[ "$local_ref" == refs/heads/* ]] || [[ "$remote_ref" == refs/heads/* ]]; then
+        PUSHING_BRANCH_PUSH=true
         PUSH_LOCAL_SHA="$local_sha"
+        if [[ "$remote_ref" == refs/heads/* ]]; then
+            PUSH_TARGET_BRANCH="${remote_ref#refs/heads/}"
+        elif [[ "$local_ref" == refs/heads/* ]]; then
+            PUSH_TARGET_BRANCH="${local_ref#refs/heads/}"
+        fi
     fi
 done
 
-# Version check + publish only applies to main-dev pushes
-if [ "$PUSHING_MAIN_DEV" != true ]; then
+# Version check + publish only applies to branch pushes
+if [ "$PUSHING_BRANCH_PUSH" != true ]; then
     exit 0
 fi
 
@@ -233,7 +239,7 @@ schedule_publish() {
         cd "$REPO_DIR" || exit 1
 
         # Verify the push actually landed before publishing
-        remote_sha="$(git ls-remote origin "refs/heads/main-dev" | awk '{print $1}')"
+        remote_sha="$(git ls-remote origin "refs/heads/${target_branch}" | awk '{print $1}')"
         if [ -n "$PUSH_LOCAL_SHA" ] && [ -n "$remote_sha" ] && [ "$remote_sha" != "$PUSH_LOCAL_SHA" ]; then
             {
                 echo "⏭ Skip publish: push SHA mismatch"
@@ -343,7 +349,7 @@ echo -e "${GREEN}✓ [${REPO_NAME}] Version: ${CURRENT_VERSION}${NC}"
 
 
 if [ "$PUBLISH_REQUESTED" != true ]; then
-    echo -e "${DIM}  (publish disabled by default — use 'git push -o ${PUBLISH_TRIGGER_FLAG} origin main-dev' to publish)${NC}"
+    echo -e "${DIM}  (publish disabled by default — use 'git push -o ${PUBLISH_TRIGGER_FLAG} origin <feature-branch>' to publish)${NC}"
 elif has_pypi_token; then
     echo -e "${BLUE}📦 Publish requested for ${CURRENT_VERSION} via push flag...${NC}"
     WANT_PUBLISH=true
