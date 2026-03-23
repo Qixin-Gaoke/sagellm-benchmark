@@ -70,7 +70,7 @@ git filter-repo --path data/raw/ --invert-paths
 git filter-repo --path hf_datasets_cache/ --invert-paths
 
 # After rewriting history, force-push (coordinate with team)
-git push --force-with-lease origin main-dev
+git push --force-with-lease origin main
 ```
 
 ⚠️ **Rewriting history breaks all existing forks/clones**. Coordinate with the

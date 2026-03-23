@@ -654,7 +654,7 @@ on:
   push:
     branches:
       - main
-      - main-dev
+      - main
     paths:
       - 'hf_data/**/*.json'  # 只监听 hf_data/ 变化
 
