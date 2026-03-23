@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README 与 QUICKSTART 现补充流式 serving benchmark、dataset 驱动压测、以及 `request_rate` / `burstiness` / `ramp_up` traffic API 的用法说明，并明确 `compare` 是唯一推荐的跨引擎入口，`vllm-compare` 仅保留 setup helper。
 
 ### Fixed
+- `quickstart.sh --dev` 与 `pyproject.toml` 中的 `dev` extra 不再把 `lmdeploy-client` 当作默认开发安装的一部分；基础开发环境现在只安装本地工具依赖，第三方 compare client 继续通过 `vllm-client` / `vllm-ascend-client` / `lmdeploy-client` extras 显式按需安装，避免 `pip install -e .[dev]` 因自引用 extra 或当前索引缺失 `lmdeploy` 而卡死/失败。
+- `quickstart.sh` 安装 Git hooks 时现在会识别 `hooks/*` 已经与 `.git/hooks/*` 指向同一文件的场景，并跳过自复制；不再因为 `cp: ... are the same file` 让整个 quickstart 在最后一步失败。
 - OpenAI-compatible chat stream benchmark 现在会显式识别 `event=error` SSE chunk，并把 `trace_id` / `error_code` 写入 `BenchmarkResult`；benchmark 不再把带结构化错误终止的流请求误计为成功完成。
 - chat-stream compare 在“首轮无 content delta token”场景下的重试日志由 warning 降为 info，并增加轻量异步退避，避免成功重试时在正式 compare 控制台产生误导性告警噪音。
 - `GatewayClient` 的 chat-stream benchmark 现对“无 content delta token 即结束”的随机流事件增加可配置重试（默认 1 次，可通过 `SAGELLM_BENCHMARK_STREAM_ZERO_CONTENT_RETRIES` 覆盖），以减少官方 `vllm_random` 场景下 `b2/b4` 的偶发 1/1 失败抖动，同时保持 strict minimal payload 与 `/v1/chat/completions` 主路径边界不变。

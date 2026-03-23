@@ -58,9 +58,8 @@ vllm-ascend-client = [
     "vllm-ascend>=0.11.0",
 ]
 dev = [
-    # dev includes common optional comparison clients; install vLLM variants
+    # dev keeps local tooling lightweight; install compare-client extras
     # explicitly when that environment is actually needed.
-    "isagellm-benchmark[full]",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
