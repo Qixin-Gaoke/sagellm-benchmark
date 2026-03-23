@@ -193,8 +193,20 @@ install_pypi_baseline() {
 
 install_current_repo() {
     if [ "$INSTALL_MODE" = "dev" ]; then
-        echo -e "${BLUE}📦 安装当前仓库（editable + dev）${NC}"
-        run_with_diagnostics "安装当前仓库 .[dev]" "${PIP_CMD[@]}" install -e ".[dev]"
+        local dev_deps=(
+            "pytest>=7.0.0"
+            "pytest-cov>=4.0.0"
+            "pytest-asyncio>=0.21.0"
+            "ruff>=0.1.0"
+            "httpx>=0.24.0"
+            "isage-pypi-publisher>=0.2.0.0"
+        )
+
+        echo -e "${BLUE}📦 安装开发工具依赖（避免 .[dev] 自引用回溯）${NC}"
+        run_with_diagnostics "安装开发工具依赖" "${PIP_CMD[@]}" install "${dev_deps[@]}"
+
+        echo -e "${BLUE}📦 安装当前仓库（editable, --no-deps）${NC}"
+        run_with_diagnostics "安装当前仓库 . (editable --no-deps)" "${PIP_CMD[@]}" install -e . --no-deps
     else
         echo -e "${BLUE}📦 安装当前仓库（editable）${NC}"
         run_with_diagnostics "安装当前仓库 ." "${PIP_CMD[@]}" install -e .
@@ -269,6 +281,12 @@ install_hooks() {
             hook_name=$(basename "$hook_src")
             local hook_dst
             hook_dst="$PROJECT_ROOT/.git/hooks/$hook_name"
+            if [ "$(realpath "$hook_src")" = "$(realpath "$hook_dst")" ]; then
+                chmod +x "$hook_dst"
+                echo -e "  ${GREEN}✓ $hook_name (already installed)${NC}"
+                installed=$((installed + 1))
+                continue
+            fi
             cp "$hook_src" "$hook_dst"
             chmod +x "$hook_dst"
             echo -e "  ${GREEN}✓ $hook_name${NC}"
