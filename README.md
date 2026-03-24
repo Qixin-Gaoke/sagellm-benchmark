@@ -13,6 +13,14 @@
 
 Benchmark suite for sageLLM inference engine performance and validation.
 
+## Code Organization
+
+- `src/sagellm_benchmark/`: benchmark CLI, metric collection, compare flows, and artifact generation.
+- `tests/`: client, metrics, and workflow regression coverage.
+- `benchmarks/`, `benchmark_baselines/`, and `benchmark_results/`: benchmark inputs, golden baselines, and produced outputs.
+- `scripts/` plus root shell entrypoints such as `run_benchmark.sh` and `sync_results_to_website.sh`: orchestration helpers that should remain thin wrappers over the CLI.
+- `docs/`, `examples/`, and `hf_data/`: operator guidance, sample benchmark flows, and benchmark input assets.
+
 New here? See [QUICKSTART.md](QUICKSTART.md) for a 5-minute guide.
 
 Canonical boundary note: performance-path ownership is defined in <https://github.com/intellistream/sagellm-docs/blob/main/docs/specs/performance_mainline_architecture.md>. `sagellm-benchmark` validates the main path externally; it does not define runtime semantics for `sagellm-core`.

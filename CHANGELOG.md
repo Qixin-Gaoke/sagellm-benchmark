@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `README.md` 新增仓库级 `Code Organization` 说明，明确 `src/`、`tests/`、`benchmarks/`、`benchmark_baselines/`、`benchmark_results/`、`scripts/` 与 root shell wrappers 的分工，避免 benchmark orchestration 和 runtime semantics 再次混层。
+
 ### Added
 - 新增 `compatibility_matrix.py` 兼容性门禁模块：可对协议版本协商、错误码分布、以及 stream/non-stream 一致性执行结构化判定，并输出 `compatibility_pass_rate`、`version_mismatch_total` 与 `error_code_distribution`，为发布前回归矩阵提供统一结果格式。
 - 新增 profile-first workload 语义层：`vllm_random` / `vllm_sharegpt` / `vllm_hf` / `vllm_custom` 与统一字段（`workload_profile`、`dataset_name`、`supplements`、`scenario_source`）。
